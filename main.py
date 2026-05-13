@@ -184,7 +184,7 @@ class HetCommunity(Community):
         sigs[NODE_ID] = signature
         message = SubmissionPayload(self.group_id, payload.payload.round_number, *sigs.values())
 
-        if all(len(sig) > 0 for sig in sigs.values()):
+        if all(len(sig) > 0 for sig in sigs.values()) and not self.state == State.SUCCESS:
             self.ez_send(self.boss, message)
         else:
             for _, peer in self.peers.items():
