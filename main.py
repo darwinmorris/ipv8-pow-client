@@ -283,7 +283,7 @@ async def start_ipv8(node_id: int) -> None:
                     if len(community.readies) == 2:
                         community.state = State.BEGIN_CHALLENGE
                     else:
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(0.25)
                 case State.BEGIN_CHALLENGE:
                     print("begin challenge")
                     community.begin_challenge()
@@ -297,7 +297,7 @@ async def start_ipv8(node_id: int) -> None:
                 case State.SUCCESS:
                     print("Success state")
             
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.1)
             
         
         # await community.done.wait()
