@@ -88,6 +88,7 @@ RegisterResponsePayload(False, None, None)
 ChallengeResponsePayload(None, None, None)
 SubmissionPayload(None, None, None, None, None)
 SubmissionResponsePayload(False, None, None, None)
+InternalSubmissionPayload(None, None)
 
 class HetCommunity(Community):
     community_id = COMMUNITY_ID

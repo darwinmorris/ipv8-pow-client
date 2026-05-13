@@ -22,3 +22,5 @@ ruff_cache/
 build/
 dist/
 *.egg-info/
+
+.env
