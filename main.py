@@ -11,6 +11,8 @@ from ipv8.messaging.payload_dataclass import DataClassPayload
 from ipv8.keyvault.crypto import default_eccrypto
 from dataclasses import dataclass
 import os
+import json
+from dotenv import load_dotenv
 
 NONCE_FILE = "nonce.txt"
 EMAIL = "D.B.Morris-1@student.tudelft.nl"
@@ -18,15 +20,17 @@ GITHUB_URL = "https://github.com/darwinmorris/ipv8-pow-client"
 KEY_FILE = "lab1_key.pem"
 
 COMMUNITY_ID = bytes.fromhex(
-    "2c1cc6e35ff484f99ebdfb6108477783c0102881"
+    "4c61623247726f75705369676e696e6732303236"
 )
 
 SERVER_PUBLIC_KEY = bytes.fromhex(
-    "4c69624e61434c504b3a86b23934a28d669c390e2d1fc0b0870706c4591cc0cb178bc5a811da6d87d27ef319b2638ef60cc8d119724f4c53a1ebfad919c3ac4136c501ce5c09364e0ebb"
+    "4c69624e61434c504b3a82e33614a342774e084af80835838d6dbdb64a537d3ddb6c1d82011a7f101553cda40cf5fa0e0fc23abd0a9c4f81322282c5b34566f6b8401f5f683031e60c96"
 )
 
-NODE_ID = os.getenv("NODE_ID")
-PUBLIC_KEYS = os.getenv("PUBLIC_KEYS")
+load_dotenv()
+
+NODE_ID = int(os.getenv("NODE_ID"))
+PUBLIC_KEYS = json.loads(os.getenv("PUBLIC_KEYS"))
 
 def has_leading_zeros(digest: bytes) -> bool:
     return (
@@ -86,6 +90,10 @@ class SubmissionResponsePayload(DataClassPayload[6]):
     rounds_completed: int
     message: str
 
+RegisterResponsePayload(False, None, None)
+ChallengeResponsePayload(None, None, None)
+SubmissionPayload(None, None, None, None, None)
+SubmissionResponsePayload(False, None, None, None)
 
 
 def find_nonce(email: str, github_url: str) -> int:
@@ -246,23 +254,6 @@ class HetCommunity(Community):
 
 
 async def start_ipv8() -> None:
-    print("Proof of work")
-    try:
-        with open(NONCE_FILE) as f:
-            nonce = int(f.read().strip())
-
-        print(f"Loaded nonce: {nonce}")
-
-    except FileNotFoundError:
-        print("Mining proof of work...")
-        nonce = find_nonce(EMAIL, GITHUB_URL)
-
-        with open(NONCE_FILE, "w") as f:
-            f.write(str(nonce))
-        
-
-    print(f"Found nonce: {nonce}")
-
     builder = ConfigBuilder()
     builder.clear_keys()
     builder.clear_overlays()
