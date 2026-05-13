@@ -27,7 +27,7 @@ SERVER_PUBLIC_KEY = bytes.fromhex(
 load_dotenv()
 
 NODE_ID = int(os.getenv("NODE_ID"))
-PUBLIC_KEYS = json.loads(os.getenv("PUBLIC_KEYS"))
+PUBLIC_KEYS = [bytes.fromhex(k) for k in json.loads(os.getenv("PUBLIC_KEYS"))]
 
 from ipv8.messaging.lazy_payload import VariablePayload, vp_compile
 
@@ -116,17 +116,6 @@ class HetCommunity(Community):
         
         return len(self.peers.keys()) == 2 and self.boss
     
-    def register_attempt(self, email: str, github_url: str, nonce: int) -> bool:
-        server = self.find_peer()
-        
-        if server is None:
-            return False
-
-        print("Found correct peer, sending submission")
-
-        self.ez_send(server, SubmissionPayload(email, github_url, nonce))
-        return True
-
     def register_group(self) -> bool:
         self.ez_send(self.boss, RegisterPayload(PUBLIC_KEYS[0], PUBLIC_KEYS[1], PUBLIC_KEYS[2]))
 
@@ -155,13 +144,13 @@ class HetCommunity(Community):
         signature = default_eccrypto.create_signature(key, self.curr_challenge.nonce)
 
         sigs = {
-            0: None,
-            1: None,
-            2: None,
+            0: b"",
+            1: b"",
+            2: b"",
         }
 
         sigs[NODE_ID] = signature
-        message = SubmissionPayload(self.group_id, self.curr_challenge.round_number, *sigs)
+        message = SubmissionPayload(self.group_id, self.curr_challenge.round_number, *sigs.values())
         
         
         for _, peer in self.peers.items():
@@ -176,7 +165,7 @@ class HetCommunity(Community):
             pem_bytes = f.read()
         
         key = default_eccrypto.key_from_private_bin(pem_bytes)
-        signature = default_eccrypto.create_signature(key, self.challenge_response.nonce)
+        signature = default_eccrypto.create_signature(key, self.curr_challenge.nonce)
         
         # should store state here but okay for now
         sigs = {
@@ -186,17 +175,18 @@ class HetCommunity(Community):
         }
 
         sigs[NODE_ID] = signature
-        message = SubmissionPayload(self.group_id, self.challenge_response.round_number, *sigs.values())
+        message = SubmissionPayload(self.group_id, self.curr_challenge.round_number, *sigs.values())
 
-        if not None in sigs.values():
+        if all(len(sig) > 0 for sig in sigs.values()):
             self.ez_send(self.boss, message)
         else:
-            for _, peer in self.peers:
+            for _, peer in self.peers.items():
                 self.ez_send(peer, message)
         
     @lazy_wrapper(SubmissionResponsePayload)
     def submission_response(self, peer: Peer, payload: SubmissionResponsePayload):
         self.state = State.BEGIN_CHALLENGE
+        print(f"Payload: {payload}")
 
 
         
@@ -262,7 +252,7 @@ async def start_ipv8() -> None:
                     community.register_group()
                 case State.BEGIN_CHALLENGE:
                     community.begin_challenge()
-                case State.BEGIN_ROUND():
+                case State.BEGIN_ROUND:
                     community.begin_round()
                     await asyncio.sleep(0.2)
                     community.state = State.BEGIN_CHALLENGE
