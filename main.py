@@ -240,6 +240,8 @@ async def start_ipv8() -> None:
                     community.begin_round()
                     await asyncio.sleep(0.2)
                     community.state = State.BEGIN_CHALLENGE
+                case State.SUCCESS:
+                    print("success state")
             
             await asyncio.sleep(0.2)
             
