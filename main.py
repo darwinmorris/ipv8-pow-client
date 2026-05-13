@@ -107,7 +107,7 @@ class HetCommunity(Community):
 
         self.add_message_handler(RegisterResponsePayload, self.register_response)
         self.add_message_handler(ChallengeResponsePayload, self.challenge_response)
-        self.add_message_handler(SubmissionPayload, self.submission_payload)
+        self.add_message_handler(InternalSubmissionPayload, self.submission_payload)
         self.add_message_handler(SubmissionResponsePayload, self.submission_response)
 
     def find_peers(self) -> bool:
