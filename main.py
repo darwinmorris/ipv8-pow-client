@@ -1,5 +1,8 @@
+import argparse
 import asyncio
+from calendar import c
 from enum import Enum, auto
+from tkinter import SE
 from ipv8.configuration import ConfigBuilder, Strategy, WalkerDefinition, default_bootstrap_defs
 from ipv8_service import IPv8
 import hashlib
@@ -14,7 +17,7 @@ import os
 import json
 from dotenv import load_dotenv
 
-KEY_FILE = "lab1_key.pem"
+KEY_FILE = None
 
 COMMUNITY_ID = bytes.fromhex(
     "4c61623247726f75705369676e696e6732303236"
@@ -26,14 +29,12 @@ SERVER_PUBLIC_KEY = bytes.fromhex(
 
 load_dotenv()
 
-NODE_ID = int(os.getenv("NODE_ID"))
 PUBLIC_KEYS = [bytes.fromhex(k) for k in json.loads(os.getenv("PUBLIC_KEYS"))]
-
-from ipv8.messaging.lazy_payload import VariablePayload, vp_compile
 
 
 class State(Enum):
     FIND_PEERS = auto()
+    READY = auto()
     REGISTER = auto()
     BEGIN_CHALLENGE = auto()
     BEGIN_ROUND = auto()
@@ -84,6 +85,10 @@ class SubmissionResponsePayload(DataClassPayload[6]):
     rounds_completed: int
     message: str
 
+@dataclass
+class ReadyPayload(DataClassPayload[8]):
+    pass
+
 RegisterResponsePayload(False, None, None)
 ChallengeResponsePayload(None, None, None)
 SubmissionPayload(None, None, None, None, None)
@@ -96,15 +101,28 @@ class HetCommunity(Community):
 
     def __init__(self, settings: CommunitySettings) -> None:
         super().__init__(settings)
+        if not hasattr(settings, "node_id"):
+            msg = "HetCommunity overlay initialize must include node_id"
+            raise ValueError(msg)
+        self.node_id: int = settings.node_id  # type: ignore[attr-defined]
         self.done = False
         
         self.boss = None
         self.peers = {}
+
+        self.readies = set()
+        
         self.submit_successful_challenge = False
         self.group_id = None
         self.state = State.FIND_PEERS
         self.curr_challenge = None
+        self.sigs = {
+            0: b"",
+            1: b"",
+            2: b"",
+        }
 
+        self.add_message_handler(ReadyPayload, self.ready)
         self.add_message_handler(RegisterResponsePayload, self.register_response)
         self.add_message_handler(ChallengeResponsePayload, self.challenge_response)
         self.add_message_handler(InternalSubmissionPayload, self.submission_payload)
@@ -125,39 +143,50 @@ class HetCommunity(Community):
     def register_group(self) -> bool:
         self.ez_send(self.boss, RegisterPayload(PUBLIC_KEYS[0], PUBLIC_KEYS[1], PUBLIC_KEYS[2]))
 
+
+    @lazy_wrapper(ReadyPayload)
+    def ready(self, peer: Peer, payload: ReadyPayload) -> bool:
+        self.readies.add(peer.public_key.key_to_bin())
+
+    def send_ready(self) -> bool:
+        for peer in self.peers.values():
+            self.ez_send(peer, ReadyPayload())
+
     @lazy_wrapper(RegisterResponsePayload)
     def register_response(self, peer: Peer, payload: RegisterResponsePayload) -> bool:
         if payload.success:
             self.group_id = payload.group_id
-            self.state = State.BEGIN_CHALLENGE
-            return 
+            self.state = State.READY
+            return True
     
     def begin_challenge(self) -> bool:
         self.ez_send(self.boss, ChallengeRequestPayload(self.group_id))
     
     @lazy_wrapper(ChallengeResponsePayload)
     def challenge_response(self, peer: Peer, payload: ChallengeResponsePayload) -> bool:
+        # if self.curr_challenge is not None and payload.round_number <= self.curr_challenge.round_number:
+        #     self.state = State.ROUND
+        #     return
         self.curr_challenge = payload
         self.state = State.BEGIN_ROUND
         return True
     
     def begin_round(self) -> bool:
-
         with open(KEY_FILE, "rb") as f:
             pem_bytes = f.read()
         
         key = default_eccrypto.key_from_private_bin(pem_bytes)
         signature = default_eccrypto.create_signature(key, self.curr_challenge.nonce)
-
-        sigs = {
+        
+        self.sigs = {
             0: b"",
             1: b"",
             2: b"",
         }
 
-        sigs[NODE_ID] = signature
+        self.sigs[self.node_id] = signature
         message = InternalSubmissionPayload(nonce=self.curr_challenge.nonce, 
-                                            payload=SubmissionPayload(self.group_id, self.curr_challenge.round_number, *sigs.values()))
+                                            payload=SubmissionPayload(self.group_id, self.curr_challenge.round_number, *self.sigs.values()))
         
         
         for _, peer in self.peers.items():
@@ -167,24 +196,38 @@ class HetCommunity(Community):
 
     @lazy_wrapper(InternalSubmissionPayload)
     def submission_payload(self, peer: Peer, payload: InternalSubmissionPayload) -> bool:
-        
-        with open(KEY_FILE, "rb") as f:
-            pem_bytes = f.read()
-        
-        key = default_eccrypto.key_from_private_bin(pem_bytes)
-        signature = default_eccrypto.create_signature(key, payload.nonce)
-        
-        # should store state here but okay for now
-        sigs = {
+        payload_sigs = {
             0: payload.payload.sig1,
             1: payload.payload.sig2,
             2: payload.payload.sig3
         }
+        
+        # if len(payload_sigs[self.node_id]) > 0 or self.curr_challenge is not None and payload.payload.round_number < self.curr_challenge.round_number:
+        if self.curr_challenge is not None and payload.payload.round_number < self.curr_challenge.round_number:
+            return
+        
+        if self.curr_challenge is None or payload.payload.round_number > self.curr_challenge.round_number:
+            self.sigs = payload_sigs
+            if self.state != State.SUCCESS:
+                self.state = State.ROUND
+        else:
+            self.sigs = {
+                0: payload.payload.sig1 if len(payload.payload.sig1) > 0 else self.sigs[0],
+                1: payload.payload.sig2 if len(payload.payload.sig2) > 0 else self.sigs[1],
+                2: payload.payload.sig3 if len(payload.payload.sig3) > 0 else self.sigs[2]
+            }
 
-        sigs[NODE_ID] = signature
-        message = SubmissionPayload(self.group_id, payload.payload.round_number, *sigs.values())
+        with open(KEY_FILE, "rb") as f:
+            pem_bytes = f.read()
+        key = default_eccrypto.key_from_private_bin(pem_bytes)
+        signature = default_eccrypto.create_signature(key, payload.nonce)
+        self.sigs[self.node_id] = signature
 
-        if all(len(sig) > 0 for sig in sigs.values()) and not self.state == State.SUCCESS:
+        message = SubmissionPayload(self.group_id, payload.payload.round_number, *self.sigs.values())
+
+        if all(len(sig) > 0 for sig in self.sigs.values()) and not self.state == State.SUCCESS:
+            print(f"Current state: {self.state}")
+            print(f"Sending to boss: {message}")
             self.ez_send(self.boss, message)
         else:
             for _, peer in self.peers.items():
@@ -192,14 +235,15 @@ class HetCommunity(Community):
         
     @lazy_wrapper(SubmissionResponsePayload)
     def submission_response(self, peer: Peer, payload: SubmissionResponsePayload):
-        self.state = State.BEGIN_CHALLENGE
-        print(f"Payload: {payload}")
+        print(f"Submission response: {payload.message}")
         if payload.success:
             self.state = State.SUCCESS
+        elif self.state != State.SUCCESS:
+            self.state = State.BEGIN_CHALLENGE
             
 
 
-async def start_ipv8() -> None:
+async def start_ipv8(node_id: int) -> None:
     builder = ConfigBuilder()
     builder.clear_keys()
     builder.clear_overlays()
@@ -213,7 +257,7 @@ async def start_ipv8() -> None:
     builder.add_overlay("HetCommunity", "hetpeer",
                             [WalkerDefinition(Strategy.RandomWalk,
                                               10, {"timeout": 3.0})],
-                            default_bootstrap_defs, {}, [])
+                            default_bootstrap_defs, {"node_id": node_id}, [])
 
     ipv8 = IPv8(builder.finalize(),
                    extra_communities={"HetCommunity": HetCommunity})
@@ -223,28 +267,37 @@ async def start_ipv8() -> None:
 
     print("IPv8 started, searching for peer")
     try:
-        # while not community.register_attempt(EMAIL, GITHUB_URL, nonce):
-        #     print(f"peers: {community.get_peers()}")
-        #     await asyncio.sleep(2)
         print(f"Starting main loop...")
         while not community.done:
             print(f"Current state: {community.state}")
-            match community.state:
+            match community.state:    
                 case State.FIND_PEERS:
                     if community.find_peers():
                         community.state = State.REGISTER
+                    else:
+                        await asyncio.sleep(0.2)
                 case State.REGISTER:
                     community.register_group()
+                case State.READY:
+                    community.send_ready()
+                    if len(community.readies) == 2:
+                        community.state = State.BEGIN_CHALLENGE
+                    else:
+                        await asyncio.sleep(1)
                 case State.BEGIN_CHALLENGE:
+                    print("begin challenge")
                     community.begin_challenge()
                 case State.BEGIN_ROUND:
                     community.begin_round()
-                    await asyncio.sleep(0.2)
-                    community.state = State.BEGIN_CHALLENGE
+                    # await asyncio.sleep(0.2)
+                    # community.state = State.BEGIN_CHALLENGE
+                case State.ROUND:
+                    community.begin_challenge()
+                    pass
                 case State.SUCCESS:
-                    print("success state")
+                    print("Success state")
             
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(1)
             
         
         # await community.done.wait()
@@ -254,5 +307,19 @@ async def start_ipv8() -> None:
         await ipv8.stop()
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="IPv8 PoW signing client")
+    parser.add_argument(
+        "--node-id",
+        type=int,
+        required=True,
+        choices=(0, 1, 2),
+        help="This peer's index in the group (matches sig slot and PUBLIC_KEYS order)",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    asyncio.run(start_ipv8())
+    _args = _parse_args()
+    KEY_FILE = f"lab1_key_{_args.node_id}.pem"
+    asyncio.run(start_ipv8(_args.node_id))
