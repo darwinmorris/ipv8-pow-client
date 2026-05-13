@@ -1,4 +1,5 @@
 import asyncio
+from enum import Enum, auto
 from ipv8.configuration import ConfigBuilder, Strategy, WalkerDefinition, default_bootstrap_defs
 from ipv8_service import IPv8
 import hashlib
@@ -6,7 +7,10 @@ from ipv8.community import Community, CommunitySettings
 from ipv8.lazy_community import lazy_wrapper
 from ipv8.peer import Peer
 from ipv8.messaging.lazy_payload import VariablePayload, vp_compile
-
+from ipv8.messaging.payload_dataclass import DataClassPayload
+from ipv8.keyvault.crypto import default_eccrypto
+from dataclasses import dataclass
+import os
 
 NONCE_FILE = "nonce.txt"
 EMAIL = "D.B.Morris-1@student.tudelft.nl"
@@ -21,7 +25,8 @@ SERVER_PUBLIC_KEY = bytes.fromhex(
     "4c69624e61434c504b3a86b23934a28d669c390e2d1fc0b0870706c4591cc0cb178bc5a811da6d87d27ef319b2638ef60cc8d119724f4c53a1ebfad919c3ac4136c501ce5c09364e0ebb"
 )
 
-
+NODE_ID = os.getenv("NODE_ID")
+PUBLIC_KEYS = os.getenv("PUBLIC_KEYS")
 
 def has_leading_zeros(digest: bytes) -> bool:
     return (
@@ -34,18 +39,54 @@ def has_leading_zeros(digest: bytes) -> bool:
 from ipv8.messaging.lazy_payload import VariablePayload, vp_compile
 
 
-@vp_compile
-class SubmissionPayload(VariablePayload):
-    msg_id = 1
-    format_list = ["varlenHutf8", "varlenHutf8", "q"]
-    names = ["email", "github_url", "nonce"]
+class State(Enum):
+    FIND_PEERS = auto()
+    REGISTER = auto()
+    BEGIN_CHALLENGE = auto()
+    BEGIN_ROUND = auto()
+    ROUND = auto()
+    SUCCESS = auto()
 
 
-@vp_compile
-class ResponsePayload(VariablePayload):
-    msg_id = 2
-    format_list = ["?", "varlenHutf8"]
-    names = ["success", "message"]
+
+@dataclass
+class RegisterPayload(DataClassPayload[1]):
+    member_key1: bytes
+    member_key2: bytes
+    member_key3: bytes
+
+@dataclass
+class RegisterResponsePayload(DataClassPayload[2]):
+    success: bool
+    group_id: str
+    message: str
+
+@dataclass
+class ChallengeRequestPayload(DataClassPayload[3]):
+    group_id: str
+
+@dataclass
+class ChallengeResponsePayload(DataClassPayload[4]):
+    nonce: bytes
+    round_number: int
+    deadline: float
+
+@dataclass
+class SubmissionPayload(DataClassPayload[5]):
+    group_id: str
+    round_number: int
+    sig1: bytes
+    sig2: bytes
+    sig3: bytes
+
+@dataclass
+class SubmissionResponsePayload(DataClassPayload[6]):
+    success: bool
+    round_number: int
+    rounds_completed: int
+    message: str
+
+
 
 def find_nonce(email: str, github_url: str) -> int:
     prefix = email.encode("utf-8") + b"\n" + github_url.encode("utf-8") + b"\n"
@@ -70,17 +111,31 @@ def find_nonce(email: str, github_url: str) -> int:
 class HetCommunity(Community):
     community_id = COMMUNITY_ID
 
+
     def __init__(self, settings: CommunitySettings) -> None:
         super().__init__(settings)
         self.done = asyncio.Event()
-        self.add_message_handler(ResponsePayload, self.on_response)
+        
+        self.boss = None
+        self.peers = {}
+        self.submit_successful_challenge = False
+        self.group_id = None
+        self.state = State.REGISTER
+        self.curr_challenge = None
 
-    def find_peer(self):
+        self.add_message_handler(RegisterResponsePayload, self.register_response)
+        self.add_message_handler(ChallengeResponsePayload, self.challenge_response)
+        self.add_message_handler(SubmissionPayload, self.submission_payload)
+        self.add_message_handler(SubmissionResponsePayload, self.submission_response)
+
+    def find_peers(self) -> bool:
         for peer in self.get_peers():
             if peer.public_key.key_to_bin() == SERVER_PUBLIC_KEY:
-                return peer
+                self.boss = peer
+            if peer.public_key.key_to_bin() in PUBLIC_KEYS:
+                self.peers[PUBLIC_KEYS.index(peer.public_key.key_to_bin())] = peer
         
-        return None
+        return len(self.peers.keys()) == 2 and self.boss
     
     def register_attempt(self, email: str, github_url: str, nonce: int) -> bool:
         server = self.find_peer()
@@ -93,15 +148,99 @@ class HetCommunity(Community):
         self.ez_send(server, SubmissionPayload(email, github_url, nonce))
         return True
 
+    def register_group(self) -> bool:
+        self.ez_send(self.boss, RegisterPayload(PUBLIC_KEYS[0], PUBLIC_KEYS[1], PUBLIC_KEYS[2]))
+
+    @lazy_wrapper(RegisterResponsePayload)
+    def register_response(self, peer: Peer, payload: RegisterResponsePayload) -> bool:
+        if payload.success:
+            self.group_id = payload.group_id
+            self.state = State.BEGIN_CHALLENGE
+            return 
     
-    @lazy_wrapper(ResponsePayload)
-    def on_response(self, peer: Peer, payload: ResponsePayload) -> None:
-        if peer.public_key.key_to_bin() != SERVER_PUBLIC_KEY:
-            print("Ignore")
-            return
-        print(payload.success)
-        print(payload.message)
-        self.done.set()
+    def begin_challenge(self) -> bool:
+        self.ez_send(self.boss, ChallengeRequestPayload(self.group_id))
+    
+    @lazy_wrapper(ChallengeResponsePayload)
+    def challenge_response(self, peer: Peer, payload: ChallengeResponsePayload) -> bool:
+        self.curr_challenge = payload
+        self.state = State.BEGIN_ROUND
+        return True
+    
+    def begin_round(self) -> bool:
+
+        with open(KEY_FILE, "rb") as f:
+            pem_bytes = f.read()
+        
+        key = default_eccrypto.key_from_private_bin(pem_bytes)
+        signature = default_eccrypto.create_signature(key, self.curr_challenge.nonce)
+
+        sigs = {
+            0: None,
+            1: None,
+            2: None,
+        }
+
+        sigs[NODE_ID] = signature
+        message = SubmissionPayload(self.group_id, self.curr_challenge.round_number, *sigs)
+        
+        
+        for _, peer in self.peers:
+            self.ez_send(peer, message)
+        
+        self.state = State.ROUND
+
+    @lazy_wrapper(SubmissionPayload)
+    def submission_payload(self, peer: Peer, payload: SubmissionPayload) -> bool:
+        
+        with open(KEY_FILE, "rb") as f:
+            pem_bytes = f.read()
+        
+        key = default_eccrypto.key_from_private_bin(pem_bytes)
+        signature = default_eccrypto.create_signature(key, self.challenge_response.nonce)
+        
+        # should store state here but okay for now
+        sigs = {
+            0: payload.sig1,
+            1: payload.sig2,
+            2: payload.sig3
+        }
+
+        sigs[NODE_ID] = signature
+        message = SubmissionPayload(self.group_id, self.challenge_response.round_number, *sigs)
+
+        if not None in sigs.values():
+            self.ez_send(self.boss, message)
+        else:
+            for _, peer in self.peers:
+                self.ez_send(peer, message)
+        
+    @lazy_wrapper(SubmissionResponsePayload)
+    def submission_response(self, peer: Peer, payload: SubmissionResponsePayload):
+        self.state = State.BEGIN_CHALLENGE
+
+
+        
+        
+
+
+
+
+
+
+
+
+
+
+
+    # @lazy_wrapper(ResponsePayload)
+    # def on_response(self, peer: Peer, payload: ResponsePayload) -> None:
+    #     if peer.public_key.key_to_bin() != SERVER_PUBLIC_KEY:
+    #         print("Ignore")
+    #         return
+    #     print(payload.success)
+    #     print(payload.message)
+    #     self.done.set()
     
 
 
@@ -147,9 +286,26 @@ async def start_ipv8() -> None:
 
     print("IPv8 started, searching for peer")
     try:
-        while not community.register_attempt(EMAIL, GITHUB_URL, nonce):
-            print(f"peers: {community.get_peers()}")
-            await asyncio.sleep(2)
+        # while not community.register_attempt(EMAIL, GITHUB_URL, nonce):
+        #     print(f"peers: {community.get_peers()}")
+        #     await asyncio.sleep(2)
+
+        while not community.done:
+            match community.state:
+                case State.FIND_PEERS:
+                    if community.find_peers:
+                        community.state = State.REGISTER
+                case State.REGISTER:
+                    community.register_group()
+                case State.BEGIN_CHALLENGE:
+                    community.begin_challenge()
+                case State.BEGIN_ROUND():
+                    community.begin_round()
+                    await asyncio.sleep(0.2)
+                    community.state = State.BEGIN_CHALLENGE
+            
+            await asyncio.sleep(0.2)
+            
         
         await community.done.wait()
 
