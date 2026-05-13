@@ -73,6 +73,11 @@ class SubmissionPayload(DataClassPayload[5]):
     sig3: bytes
 
 @dataclass
+class InternalSubmissionPayload(DataClassPayload[7]):
+    nonce: bytes
+    payload: SubmissionPayload
+                                
+@dataclass
 class SubmissionResponsePayload(DataClassPayload[6]):
     success: bool
     round_number: int
@@ -150,7 +155,8 @@ class HetCommunity(Community):
         }
 
         sigs[NODE_ID] = signature
-        message = SubmissionPayload(self.group_id, self.curr_challenge.round_number, *sigs.values())
+        message = InternalSubmissionPayload(nonce=self.curr_challenge.nonce, 
+                                            payload=SubmissionPayload(self.group_id, self.curr_challenge.round_number, *sigs.values()))
         
         
         for _, peer in self.peers.items():
@@ -158,14 +164,14 @@ class HetCommunity(Community):
         
         self.state = State.ROUND
 
-    @lazy_wrapper(SubmissionPayload)
-    def submission_payload(self, peer: Peer, payload: SubmissionPayload) -> bool:
+    @lazy_wrapper(InternalSubmissionPayload)
+    def submission_payload(self, peer: Peer, payload: InternalSubmissionPayload) -> bool:
         
         with open(KEY_FILE, "rb") as f:
             pem_bytes = f.read()
         
         key = default_eccrypto.key_from_private_bin(pem_bytes)
-        signature = default_eccrypto.create_signature(key, self.curr_challenge.nonce)
+        signature = default_eccrypto.create_signature(key, payload.nonce)
         
         # should store state here but okay for now
         sigs = {
@@ -175,43 +181,21 @@ class HetCommunity(Community):
         }
 
         sigs[NODE_ID] = signature
-        message = SubmissionPayload(self.group_id, self.curr_challenge.round_number, *sigs.values())
+        message = SubmissionPayload(self.group_id, payload.payload.round_number, *sigs.values())
 
         if all(len(sig) > 0 for sig in sigs.values()):
             self.ez_send(self.boss, message)
         else:
             for _, peer in self.peers.items():
-                self.ez_send(peer, message)
+                self.ez_send(peer, InternalSubmissionPayload(nonce=payload.nonce, payload=message))
         
     @lazy_wrapper(SubmissionResponsePayload)
     def submission_response(self, peer: Peer, payload: SubmissionResponsePayload):
         self.state = State.BEGIN_CHALLENGE
         print(f"Payload: {payload}")
-
-
-        
-        
-
-
-
-
-
-
-
-
-
-
-
-    # @lazy_wrapper(ResponsePayload)
-    # def on_response(self, peer: Peer, payload: ResponsePayload) -> None:
-    #     if peer.public_key.key_to_bin() != SERVER_PUBLIC_KEY:
-    #         print("Ignore")
-    #         return
-    #     print(payload.success)
-    #     print(payload.message)
-    #     self.done.set()
-    
-
+        if payload.success:
+            self.state = State.SUCCESS
+            
 
 
 async def start_ipv8() -> None:
