@@ -193,7 +193,7 @@ class HetCommunity(Community):
         message = SubmissionPayload(self.group_id, self.curr_challenge.round_number, *sigs)
         
         
-        for _, peer in self.peers:
+        for _, peer in self.peers.items():
             self.ez_send(peer, message)
         
         self.state = State.ROUND
@@ -215,7 +215,7 @@ class HetCommunity(Community):
         }
 
         sigs[NODE_ID] = signature
-        message = SubmissionPayload(self.group_id, self.challenge_response.round_number, *sigs)
+        message = SubmissionPayload(self.group_id, self.challenge_response.round_number, *sigs.values())
 
         if not None in sigs.values():
             self.ez_send(self.boss, message)
