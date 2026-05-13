@@ -176,9 +176,9 @@ class HetCommunity(Community):
         
         # should store state here but okay for now
         sigs = {
-            0: payload.sig1,
-            1: payload.sig2,
-            2: payload.sig3
+            0: payload.payload.sig1,
+            1: payload.payload.sig2,
+            2: payload.payload.sig3
         }
 
         sigs[NODE_ID] = signature
