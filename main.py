@@ -14,9 +14,6 @@ import os
 import json
 from dotenv import load_dotenv
 
-NONCE_FILE = "nonce.txt"
-EMAIL = "D.B.Morris-1@student.tudelft.nl"
-GITHUB_URL = "https://github.com/darwinmorris/ipv8-pow-client"
 KEY_FILE = "lab1_key.pem"
 
 COMMUNITY_ID = bytes.fromhex(
@@ -31,14 +28,6 @@ load_dotenv()
 
 NODE_ID = int(os.getenv("NODE_ID"))
 PUBLIC_KEYS = json.loads(os.getenv("PUBLIC_KEYS"))
-
-def has_leading_zeros(digest: bytes) -> bool:
-    return (
-        digest[0] == 0
-        and digest[1] == 0
-        and digest[2] == 0
-        and digest[3] < 16 
-    )
 
 from ipv8.messaging.lazy_payload import VariablePayload, vp_compile
 
@@ -95,40 +84,19 @@ ChallengeResponsePayload(None, None, None)
 SubmissionPayload(None, None, None, None, None)
 SubmissionResponsePayload(False, None, None, None)
 
-
-def find_nonce(email: str, github_url: str) -> int:
-    prefix = email.encode("utf-8") + b"\n" + github_url.encode("utf-8") + b"\n"
-    base = hashlib.sha256(prefix)
-    nonce = 0
-
-    while nonce <= 2**63 - 1:
-        h = base.copy()
-        h.update(nonce.to_bytes(8, byteorder="big", signed=True))
-        digest = h.digest()
-
-        if has_leading_zeros(digest):
-            with open(NONCE_FILE, "w") as f:
-                f.write(str(nonce))
-            return nonce
-        
-        if nonce % 1000000 == 0:
-            print(f"checked till {nonce}")
-        
-        nonce += 1
-
 class HetCommunity(Community):
     community_id = COMMUNITY_ID
 
 
     def __init__(self, settings: CommunitySettings) -> None:
         super().__init__(settings)
-        self.done = asyncio.Event()
+        self.done = False
         
         self.boss = None
         self.peers = {}
         self.submit_successful_challenge = False
         self.group_id = None
-        self.state = State.REGISTER
+        self.state = State.FIND_PEERS
         self.curr_challenge = None
 
         self.add_message_handler(RegisterResponsePayload, self.register_response)
@@ -137,10 +105,13 @@ class HetCommunity(Community):
         self.add_message_handler(SubmissionResponsePayload, self.submission_response)
 
     def find_peers(self) -> bool:
+        print(f"Searching for peers...")
         for peer in self.get_peers():
             if peer.public_key.key_to_bin() == SERVER_PUBLIC_KEY:
                 self.boss = peer
+                print(f"Boss found")
             if peer.public_key.key_to_bin() in PUBLIC_KEYS:
+                print(f"Found peer {peer.public_key.key_to_bin()}")
                 self.peers[PUBLIC_KEYS.index(peer.public_key.key_to_bin())] = peer
         
         return len(self.peers.keys()) == 2 and self.boss
@@ -280,11 +251,12 @@ async def start_ipv8() -> None:
         # while not community.register_attempt(EMAIL, GITHUB_URL, nonce):
         #     print(f"peers: {community.get_peers()}")
         #     await asyncio.sleep(2)
-
+        print(f"Starting main loop...")
         while not community.done:
+            print(f"Current state: {community.state}")
             match community.state:
                 case State.FIND_PEERS:
-                    if community.find_peers:
+                    if community.find_peers():
                         community.state = State.REGISTER
                 case State.REGISTER:
                     community.register_group()
@@ -298,7 +270,7 @@ async def start_ipv8() -> None:
             await asyncio.sleep(0.2)
             
         
-        await community.done.wait()
+        # await community.done.wait()
 
 
     finally:
