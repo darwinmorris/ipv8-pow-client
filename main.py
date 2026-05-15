@@ -1,15 +1,11 @@
 import argparse
 import asyncio
-from calendar import c
 from enum import Enum, auto
-from tkinter import SE
 from ipv8.configuration import ConfigBuilder, Strategy, WalkerDefinition, default_bootstrap_defs
 from ipv8_service import IPv8
-import hashlib
 from ipv8.community import Community, CommunitySettings
 from ipv8.lazy_community import lazy_wrapper
 from ipv8.peer import Peer
-from ipv8.messaging.lazy_payload import VariablePayload, vp_compile
 from ipv8.messaging.payload_dataclass import DataClassPayload
 from ipv8.keyvault.crypto import default_eccrypto
 from dataclasses import dataclass
