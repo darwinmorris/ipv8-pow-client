@@ -13,32 +13,35 @@ from ipv8_service import IPv8
 
 from src.blockchain import Blockchain, Transaction
 from src.core import Block, BlockHeader
-
+import json
 
 load_dotenv()
 
-
-GROUP_ID="--"
-
-
-REGISTRATION_COMMUNITY_ID = bytes.fromhex(
-    "4c616233426c6f636b636861696e323032365057"
-)
-
-SERVER_PUBLIC_KEY = bytes.fromhex(
-    "4c69624e61434c504b3ae3fc099fb56ca3b5e1de9a1c843387f2acdbb78b1bd4350ffde518068a0d246344b10d0d76873e7d7f7838f3715e025af08f791324495e083331ce6"
-)
+PUBLIC_KEYS = [
+    bytes.fromhex(k)
+    for k in json.loads(os.getenv("PUBLIC_KEYS", "[]"))
+]
 
 GROUP_ID = os.getenv("GROUP_ID", "")
 
-NODE_ID = int(os.getenv("NODE_ID", "0"))
-KEY_FILE = f"node_data/node{NODE_ID}/lab1_key.pem"
-
-BLOCKCHAIN_COMMUNITY_ID = bytes.fromhex(
-    os.getenv("BLOCKCHAIN_COMMUNITY_ID", "4c61623344617277696e436861696e32303236")
+REGISTRATION_COMMUNITY_ID = bytes.fromhex(
+    os.getenv("REGISTRATION_COMMUNITY_ID", "")
 )
 
+BLOCKCHAIN_COMMUNITY_ID = bytes.fromhex(
+    os.getenv("BLOCKCHAIN_COMMUNITY_ID", "")
+)
+
+SERVER_PUBLIC_KEY = bytes.fromhex(
+    os.getenv("SERVER_PUBLIC_KEY", "")
+)
+
+KEY_FILE = os.getenv("KEY_FILE", "")
+
+NODE_ID = int(os.getenv("NODE_ID", "0"))
+
 DIFFICULTY = int(os.getenv("DIFFICULTY", "8"))
+
 PORT = int(os.getenv("PORT", str(8090 + NODE_ID)))
 
 
@@ -169,6 +172,7 @@ class BlockchainCommunity(Community):
         self.add_message_handler(GetBlockPayload, self.on_get_block)
 
     def started(self):
+        print("and we begin")
         self.register_task("miner", self.mine_loop, interval=3.0, delay=2.0)
         self.register_task("status", self.status_loop, interval=5.0, delay=1.0)
 
@@ -311,6 +315,7 @@ class BlockchainCommunity(Community):
         )
 
     async def mine_loop(self):
+        print("Mining loop init")
         block = self.blockchain.mine_next_block()
         print(
             f"mined height={block.height} "
@@ -388,7 +393,7 @@ async def main():
     print(f"PORT={PORT}")
     print(f"KEY_FILE={KEY_FILE}")
     print(f"COMMUNITY_ID={BLOCKCHAIN_COMMUNITY_ID.hex()}")
-
+    print("building config")
     builder = ConfigBuilder()
     builder.clear_keys()
     builder.clear_overlays()
@@ -421,12 +426,19 @@ async def main():
             "RegistrationCommunity": RegistrationCommunity,
         },
     )
-
+    
     await ipv8.start()
+    print("ipv8 started")
+
+    blockchain_community = ipv8.get_overlay(BlockchainCommunity)
+    registration_community = ipv8.get_overlay(RegistrationCommunity)
 
     try:
         while True:
-            await asyncio.sleep(1)
+            await registration_community.register_loop()
+            await blockchain_community.status_loop()
+            await blockchain_community.mine_loop()
+            await asyncio.sleep(3)
     finally:
         await ipv8.stop()
 
@@ -439,4 +451,4 @@ if __name__ == "__main__":
 # Need to add server protocol 
 # handle forks
 # prop trx
-# longest chain switching
+# longest chain switching 
