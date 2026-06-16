@@ -61,8 +61,7 @@ class Blockchain:
 
         self.chain.append(block)
 
-        mined_hashes = set(tx_hashes)
-        self.mempool = [tx for tx in self.mempool if tx.hash not in mined_hashes]
+        self.remove_from_mempool(tx_hashes)
 
         validate_chain(self.chain)
         return block
@@ -74,3 +73,10 @@ class Blockchain:
 
     def validate(self) -> None:
         validate_chain(self.chain)
+
+    def remove_from_mempool(self, tx_hashes: list[bytes]) -> None:
+        mined_hashes = set(tx_hashes)
+        self.mempool = [
+            tx for tx in self.mempool
+            if tx.hash not in mined_hashes
+        ]
