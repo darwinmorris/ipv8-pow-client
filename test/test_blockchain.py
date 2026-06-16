@@ -71,3 +71,47 @@ def test_multiple_blocks_link_correctly():
     assert b3.header.prev_hash == b2.block_hash
 
     bc.validate()
+
+
+def make_tx(data: bytes = b"hello") -> Transaction:
+    return Transaction(
+        sender_key=b"sender",
+        data=data,
+        timestamp=123,
+        signature=b"sig",
+    )
+
+
+def test_add_transaction_deduplicates_mempool():
+    bc = Blockchain(difficulty=8)
+    tx = make_tx()
+
+    h1 = bc.add_transaction(tx)
+    h2 = bc.add_transaction(tx)
+
+    assert h1 == h2
+    assert len(bc.mempool) == 1
+
+
+def test_remove_from_mempool_removes_included_txs():
+    bc = Blockchain(difficulty=8)
+    tx1 = make_tx(b"one")
+    tx2 = make_tx(b"two")
+
+    h1 = bc.add_transaction(tx1)
+    h2 = bc.add_transaction(tx2)
+
+    bc.remove_from_mempool([h1])
+
+    assert [tx.hash for tx in bc.mempool] == [h2]
+
+
+def test_remove_from_mempool_ignores_unknown_hash():
+    bc = Blockchain(difficulty=8)
+    tx = make_tx()
+
+    h = bc.add_transaction(tx)
+
+    bc.remove_from_mempool([b"x" * 32])
+
+    assert [tx.hash for tx in bc.mempool] == [h]

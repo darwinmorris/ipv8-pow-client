@@ -45,8 +45,13 @@ class Blockchain:
         return self.tip.block_hash
 
     def add_transaction(self, tx: Transaction) -> bytes:
+        txh = tx.hash
+        # maybe we store mempool seen hash in bc and not node
+        if any(existing.hash == txh for existing in self.mempool):
+            return txh
+
         self.mempool.append(tx)
-        return tx.hash
+        return txh
 
     def mine_next_block(self) -> Block:
         txs = list(self.mempool)
