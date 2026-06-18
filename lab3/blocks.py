@@ -73,6 +73,7 @@ class Block:
     nonce: int
     block_hash: bytes
     tx_hashes: list[bytes]
+    
 
     def is_internally_valid(self) -> bool:
         """PoW holds, block_hash matches the header, and the body commitment matches."""
@@ -99,3 +100,106 @@ def make_block(height: int, prev_hash: bytes, tx_hashes: list[bytes],
 def genesis_block() -> Block:
     """Fixed group-wide genesis; every node boots with this exact block 0."""
     return make_block(0, b"\x00" * HASH_SIZE, [], 0, 0, 0)
+
+class Blockchain:
+    def __init__(self):
+        self.chain: list[Block] = [genesis_block()]
+        self.block_pool: dict[bytes, Block] = {}
+        self.mempool: dict[bytes, Transaction] = {}
+        self.chain_tx_hashes: set[bytes] = set()
+
+    @property
+    def height(self) -> int:
+        return len(self.chain) - 1
+
+    @property
+    def tip(self) -> Block:
+        return self.chain[-1]
+
+    def accept_transaction(self, tx: Transaction) -> bool:
+        if tx.tx_hash in self.chain_tx_hashes:
+            return False
+
+        if tx.tx_hash in self.mempool:
+            return False
+
+        self.mempool[tx.tx_hash] = tx
+        return True
+
+    def pending_tx_hashes(self) -> list[bytes]:
+        return [txh for txh in self.mempool if txh not in self.chain_tx_hashes]
+
+    def validate_block_transactions(self, block: Block) -> bool:
+        if len(block.tx_hashes) != len(set(block.tx_hashes)):
+            return False
+    
+        for tx_hash in block.tx_hashes:
+            tx = self.mempool.get(tx_hash)
+
+            if tx is None:
+                return False
+
+            if not tx.verify():
+                return False
+
+        return True
+
+    def add_block(self, block: Block) -> tuple[bool, int | None]:
+        if block.block_hash in self.block_pool:
+            return False, None
+
+        if not block.is_internally_valid():
+            return False, None
+
+        if not self.validate_block_transactions(block):
+            return False, None
+
+        self.block_pool[block.block_hash] = block
+        missing = self.try_adopt()
+        return True, missing
+
+    def try_adopt(self) -> int | None:
+        missing_height = None
+        for block in sorted(self.block_pool.values(), key=lambda b: (-b.height, b.block_hash)):
+            if block.height <= self.height and self.chain[block.height].block_hash == block.block_hash:
+                continue
+
+            branch, fork_point, missing = self.trace_branch(block)
+
+            if fork_point is None:
+                if missing is not None:
+                    missing_height = missing
+                continue
+
+            tip = self.tip
+            longer = block.height > tip.height
+            tie_win = block.height == tip.height and block.block_hash < tip.block_hash
+
+            if longer or tie_win:
+                self.chain = self.chain[:fork_point + 1] + list(reversed(branch))
+                self.chain_tx_hashes = {txh for b in self.chain for txh in b.tx_hashes}
+                break
+
+        cutoff = self.height - 10
+        for block_hash in [h for h, b in self.block_pool.items() if b.height < cutoff]:
+            del self.block_pool[block_hash]
+        
+        return missing_height
+
+    def trace_branch(self, block: Block):
+        branch = []
+        cur = block
+
+        while True:
+            branch.append(cur)
+            parent_height = cur.height - 1
+
+            if parent_height < len(self.chain) and self.chain[parent_height].block_hash == cur.prev_hash:
+                return branch, parent_height, None
+
+            parent = self.block_pool.get(cur.prev_hash)
+
+            if parent is None or parent.height != parent_height:
+                return branch, None, parent_height if parent_height >= 1 else None
+
+            cur = parent
