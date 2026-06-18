@@ -83,16 +83,17 @@ class BlockchainCommunity(Community):
         return [p for p in self.get_peers() if self.is_member(p)]
 
     # --- server query handlers ----------------------------------------------
-
+    
     @lazy_wrapper(SubmitTransaction)
     def on_submit_transaction(self, peer: Peer, payload: SubmitTransaction) -> None:
         if not self.is_trusted(peer):
             return
         tx = Transaction(payload.sender_key, payload.data, payload.timestamp, payload.signature)
         if tx.verify():
-            self.accept_transaction(tx)
-            for member in self.member_peers():
-                self.ez_send(member, TransactionGossip(tx.sender_key, tx.data, tx.timestamp, tx.signature))
+            if self.accept_transaction(tx):
+                self.gossip_to_members(
+                    TransactionGossip(tx.sender_key, tx.data, tx.timestamp, tx.signature)
+                )
             self.ez_send(peer, SubmitTransactionResponse(True, tx.tx_hash, "accepted"))
             print(f"[tx] accepted {tx.tx_hash.hex()[:16]} from server")
         else:
@@ -122,8 +123,15 @@ class BlockchainCommunity(Community):
         if not self.is_member(peer):
             return
         tx = Transaction(payload.sender_key, payload.data, payload.timestamp, payload.signature)
-        if tx.verify():
-            self.accept_transaction(tx)
+
+        if not tx.verify():
+            return
+
+        if self.accept_transaction(tx):
+            self.gossip_to_members(
+                TransactionGossip(tx.sender_key, tx.data, tx.timestamp, tx.signature),
+                exclude=peer,
+            )
 
     @lazy_wrapper(NewBlockGossip)
     def on_new_block(self, peer: Peer, payload: NewBlockGossip) -> None:
@@ -153,9 +161,15 @@ class BlockchainCommunity(Community):
 
     # --- chain state ----------------------------------------------------------
 
-    def accept_transaction(self, tx: Transaction) -> None:
-        if tx.tx_hash not in self.mempool:
-            self.mempool[tx.tx_hash] = tx
+    def accept_transaction(self, tx: Transaction) -> bool:
+        if tx.tx_hash in self.chain_tx_hashes:
+            return False
+
+        if tx.tx_hash in self.mempool:
+            return False
+
+        self.mempool[tx.tx_hash] = tx
+        return True
 
     def pending_tx_hashes(self) -> list[bytes]:
         return [txh for txh in self.mempool if txh not in self.chain_tx_hashes]
@@ -170,7 +184,7 @@ class BlockchainCommunity(Community):
         block = Block(height, prev_hash, txs_hash, timestamp, difficulty, nonce, block_hash, tx_hashes)
         if block.block_hash in self.block_pool or not block.is_internally_valid():
             return
-        self.block_pool[block.block_hash] = block
+        self.block_pool[block.block_hash] = block # we need to double check whether or not to add transactions
         self.try_adopt(peer)
 
     def try_adopt(self, peer: Peer | None = None) -> None:
@@ -220,6 +234,12 @@ class BlockchainCommunity(Community):
         targets = [peer] if peer is not None and self.is_member(peer) else self.member_peers()
         for target in targets:
             self.ez_send(target, GetBlock(height))
+    
+    def gossip_to_members(self, payload, exclude: Peer | None = None) -> None:
+        for member in self.member_peers():
+            if exclude is not None and member == exclude:
+                continue
+            self.ez_send(member, payload)
 
     # --- mining ---------------------------------------------------------------
 
@@ -265,5 +285,5 @@ class BlockchainCommunity(Community):
               f"({len(block.tx_hashes)} txs)")
         gossip = NewBlockGossip(block.height, block.prev_hash, block.txs_hash, block.timestamp,
                                 block.difficulty, block.nonce, b"".join(block.tx_hashes))
-        for member in self.member_peers():
-            self.ez_send(member, gossip)
+        
+        self.gossip_to_members(gossip)

@@ -7,7 +7,7 @@ Each node maintains:
 - A mempool of pending transactions
 - A pool of known blocks not yet on the chain
 
-Transactions are propagated between miners using gossip messages, while blocks are disseminated immediately after being mined.
+Transactions are propagated between miners using gossip messages, while blocks are disseminated immediately after being mined. Upon receiving a transaction a node gossips about it to peers to synchronize mempools.
 
 ## Consensus
 Nodes follow a longest-chain consensus protocol.
@@ -25,5 +25,10 @@ If two chains have equal height, ties are broken deterministically by selecting 
 Nodes periodically exchange chain height information. If a larger chain is detected blocks are requested.
 
 
+## TODO
+- Request multiple blocks at once?
+- re-gossip transactions
+- Better active sync for mempools?
+- Request complete transaction data
 
 
