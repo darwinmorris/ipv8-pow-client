@@ -22,6 +22,8 @@ On receiving a block:
 If two chains have equal height, ties are broken deterministically by selecting the chain whose tip block has the smaller hash value. This ensures that all nodes eventually converge on the same chain.
 
 ## Synchronization 
-Nodes periodically exchange chain height information.
+Nodes periodically exchange chain height information. If a larger chain is detected blocks are requested.
+
+
 
 
