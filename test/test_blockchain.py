@@ -12,7 +12,7 @@ from ipv8.peer import Peer
 from ipv8.peerdiscovery.network import Network
 from ipv8.test.mocking.endpoint import AutoMockEndpoint
 
-from src.blocks import genesis_block, make_block, meets_difficulty
+from src.blocks import Blockchain, Transaction, genesis_block, make_block, meets_difficulty
 from src.community import BlockchainCommunity, BlockchainSettings
 from hashlib import sha256
 from src.payloads import GetBlock, GetTransaction
@@ -259,6 +259,102 @@ def test_retry_missing_transaction_removed_when_arrived():
     community.retry_missing_transactions()
 
     assert tx_hash not in community.missing_tx_requests
+
+
+# --- regression tests: a transaction shared across competing branches ----------
+#
+# Two miners can independently mine the *same* transaction into competing blocks
+# at the same height. The losing block must still be adoptable, otherwise the two
+# nodes stay stuck on their own branch forever and the 3-way consistency check
+# fails. We used to reject such a block as a double-spend because the tx was still
+# present in the chain we were about to roll back.
+
+
+def signed_tx(data: bytes = b"shared tx") -> Transaction:
+    key = default_eccrypto.generate_key("curve25519")
+    sender_key = key.pub().key_to_bin()
+    timestamp = 1_718_000_000
+    signature = default_eccrypto.create_signature(
+        key, sender_key + data + timestamp.to_bytes(8, "big")
+    )
+    return Transaction(sender_key, data, timestamp, signature)
+
+
+def mine_block(height, prev_hash, tx_hashes, timestamp, difficulty=TEST_DIFFICULTY):
+    nonce = 0
+    while True:
+        block = make_block(height, prev_hash, tx_hashes, timestamp, difficulty, nonce)
+        if meets_difficulty(block.block_hash, difficulty):
+            return block
+        nonce += 1
+
+
+def test_equal_height_tiebreak_with_shared_transaction():
+    """Two height-1 blocks both carry the same tx. After adopting the higher-hash
+    one, the smaller-hash competitor must win the tie-break instead of being
+    rejected as a double-spend."""
+    bc = Blockchain()
+    tx = signed_tx()
+    bc.accept_transaction(tx)
+    genesis = bc.tip
+
+    # Distinct timestamps -> distinct block hashes for the two competing blocks.
+    a = mine_block(1, genesis.block_hash, [tx.tx_hash], 1_718_000_001)
+    b = mine_block(1, genesis.block_hash, [tx.tx_hash], 1_718_000_002)
+    smaller, larger = sorted((a, b), key=lambda blk: blk.block_hash)
+
+    accepted, _, _ = bc.add_block(larger)
+    assert accepted
+    assert bc.tip.block_hash == larger.block_hash
+
+    # The competitor arrives; the smaller hash must take over at the same height.
+    bc.add_block(smaller)
+    assert bc.tip.block_hash == smaller.block_hash
+    assert bc.height == 1
+
+
+def test_longer_branch_reusing_transaction_is_adopted():
+    """A taller competing branch whose base block re-includes our chain's tx must
+    still be adoptable, even when its tip arrives before its parent."""
+    bc = Blockchain()
+    tx = signed_tx()
+    bc.accept_transaction(tx)
+    genesis = bc.tip
+
+    ours = mine_block(1, genesis.block_hash, [tx.tx_hash], 1_718_000_001)
+    bc.add_block(ours)
+    assert bc.tip.block_hash == ours.block_hash
+
+    # Competing branch: b1 also carries the tx, b2 extends it one higher.
+    b1 = mine_block(1, genesis.block_hash, [tx.tx_hash], 1_718_000_050)
+    b2 = mine_block(2, b1.block_hash, [], 1_718_000_051)
+
+    # Out-of-order delivery: tip first, then the missing parent.
+    bc.add_block(b2)
+    bc.add_block(b1)
+
+    assert bc.height == 2
+    assert bc.tip.block_hash == b2.block_hash
+    assert bc.chain[1].block_hash == b1.block_hash
+
+
+def test_genuine_double_spend_within_branch_is_rejected():
+    """Guard rail: the same tx in two blocks of one branch is still a real
+    double-spend and must not be adopted."""
+    bc = Blockchain()
+    tx = signed_tx()
+    bc.accept_transaction(tx)
+    genesis = bc.tip
+
+    b1 = mine_block(1, genesis.block_hash, [tx.tx_hash], 1_718_000_001)
+    b2 = mine_block(2, b1.block_hash, [tx.tx_hash], 1_718_000_002)
+
+    bc.add_block(b1)
+    bc.add_block(b2)
+
+    # b1 is fine; b2 reusing the same tx must not extend the chain.
+    assert bc.height == 1
+    assert bc.tip.block_hash == b1.block_hash
 
 
 if __name__ == "__main__":

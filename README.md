@@ -154,6 +154,8 @@ The block pool stores blocks that are not currently part of the active chain. Th
 
 When a better chain becomes available, the node reconstructs the branch from the block pool and switches to the new chain.
 
+Double-spend protection is evaluated against the chain a branch *would* create, not the chain we are currently on. The blocks above the fork point are rolled back when we switch, so the transactions they hold are released. This lets a competing branch legitimately re-include a transaction that our current tip still carries — which is exactly what happens when two miners independently mine the same transaction into competing blocks at the same height. A transaction is only treated as a genuine double-spend if it appears twice within the prospective chain (the kept prefix plus the new branch). Without this, the two nodes would each stay stuck on their own block and never converge.
+
 ## Synchronization
 
 Nodes periodically exchange chain height information.
@@ -175,6 +177,7 @@ The implementation includes:
 - Multi-node synchronization tests
 - Chain adoption tests
 - Fork recovery tests
+- Competing-branch tests covering a transaction shared across forks (equal-height tie-break, longer-branch reorg, and genuine double-spend rejection)
 
 The tests verify that lagging miners correctly synchronize with peers and eventually converge on the same active chain. Tests are visible in the github actions pipeline.
 

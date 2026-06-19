@@ -135,15 +135,18 @@ class Blockchain:
         return [txh for txh in self.mempool if txh not in self.chain_tx_hashes]
 
     def validate_block_transactions(self, block: Block) -> tuple[bool, list[bytes]]:
+        # Only the position-independent checks live here: no duplicate hashes
+        # inside the block, and every referenced tx is known and validly signed.
+        # We deliberately do NOT reject a tx just because it is already in our
+        # active chain — a competing fork may re-include it because the blocks
+        # holding it are about to be rolled back. That double-spend decision is
+        # context-dependent and is made against the post-fork chain in try_adopt.
         if len(block.tx_hashes) != len(set(block.tx_hashes)):
             return False, []
 
         missing_txs = []
 
         for tx_hash in block.tx_hashes:
-            if tx_hash in self.chain_tx_hashes:
-                return False, []
-
             tx = self.mempool.get(tx_hash)
 
             if tx is None:
@@ -176,6 +179,22 @@ class Blockchain:
         missing_block = self.try_adopt()
         return True, missing_block, []
 
+    def branch_double_spend(self, fork_point: int, branch_blocks: list[Block]) -> bool:
+        """Would this branch put the same transaction in the chain twice?
+
+        We measure against the chain the branch would actually create: the prefix
+        we keep (chain[:fork_point + 1]) plus the branch blocks themselves. The
+        blocks above the fork point are rolled back, so any tx they hold is freed
+        and a fork is free to re-include it without it counting as a double-spend.
+        """
+        seen = {txh for b in self.chain[:fork_point + 1] for txh in b.tx_hashes}
+        for block in branch_blocks:
+            for tx_hash in block.tx_hashes:
+                if tx_hash in seen:
+                    return True
+                seen.add(tx_hash)
+        return False
+
     def try_adopt(self) -> int | None:
         missing_height = None
         for block in sorted(self.block_pool.values(), key=lambda b: (-b.height, b.block_hash)):
@@ -194,12 +213,22 @@ class Blockchain:
                     missing_height = missing
                 continue
 
+            branch_blocks = list(reversed(branch))
+
+            # Reject a branch only if it genuinely double-spends within the chain
+            # it would create — not just because the tx still sits in the chain we
+            # are about to abandon. Without this, two miners that each mine the
+            # same transaction at the same height stay stuck on their own block:
+            # neither can ever adopt the other's competing branch.
+            if self.branch_double_spend(fork_point, branch_blocks):
+                continue
+
             tip = self.tip
             longer = block.height > tip.height
             tie_win = block.height == tip.height and block.block_hash < tip.block_hash
 
             if longer or tie_win:
-                self.chain = self.chain[:fork_point + 1] + list(reversed(branch))
+                self.chain = self.chain[:fork_point + 1] + branch_blocks
                 self.chain_tx_hashes = {txh for b in self.chain for txh in b.tx_hashes}
                 break
 
