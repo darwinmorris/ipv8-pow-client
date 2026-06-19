@@ -1,30 +1,50 @@
 # Design Overview
 
-## Requirements
+Requirements
 
-- Python 3.12+
-- Dependencies managed through `pyproject.toml`
+* Python 3.12+
+* Project dependencies are managed through pyproject.toml
+* Optional: uv for dependency management and execution
 
-## Installation
+Installation
 
-Create a virtual environment and install the project:
+Using standard Python tooling:
 
-```bash
 python -m venv .venv
 source .venv/bin/activate
-
 pip install -e .
-```
 
-## Running
-```
+Using uv:
+
+uv sync
+
+Running
+
+Using standard Python tooling:
+
 python main.py --key ec_multichain.pem
-```
 
-## Testing
-```
+Using uv:
+
+uv run python main.py --key ec_multichain.pem
+
+To register the blockchain with the grading server:
+
+python main.py --key ec_multichain.pem --register
+
+Testing
+
+Using standard Python tooling:
+
 pytest
-```
+
+Using uv:
+
+uv run pytest
+
+Continuous Integration
+
+A GitHub Actions workflow automatically executes the test suite on every push and pull request to ensure that changes do not introduce regressions.
 
 ## Architecture
 
