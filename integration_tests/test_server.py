@@ -27,9 +27,9 @@ from ipv8.lazy_community import lazy_wrapper
 from ipv8.peer import Peer
 from ipv8_service import IPv8
 
-from blocks import leading_zero_bits, pack_header
-from main import derive_community_id
-from payloads import (
+from src.blocks import leading_zero_bits, pack_header
+from src.main import derive_community_id
+from src.payloads import (
     BlockResponse,
     ChainHeightResponse,
     GetBlock,
@@ -44,6 +44,7 @@ OVERALL_TIMEOUT = 300.0
 
 
 class TestServerCommunity(Community):
+    __test__ = False
     community_id = b""  # set in main()
 
     def __init__(self, settings: CommunitySettings) -> None:

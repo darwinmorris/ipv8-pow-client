@@ -15,18 +15,18 @@ from ipv8.community import Community, CommunitySettings
 from ipv8.lazy_community import lazy_wrapper
 from ipv8.peer import Peer
 
-from blocks import (
+from src.blocks import (
     DIFFICULTY,
     HASH_SIZE,
     NONCE_MASK,
     Block,
     Transaction,
-    genesis_block,
+    Blockchain,
     meets_difficulty,
     pack_header,
     txs_commitment,
 )
-from payloads import (
+from src.payloads import (
     BlockResponse,
     ChainHeightResponse,
     GetBlock,
@@ -35,8 +35,12 @@ from payloads import (
     SubmitTransaction,
     SubmitTransactionResponse,
     TransactionGossip,
+    GetTransaction,
 )
 
+RETRY_INITIAL_DELAY = 2.0
+RETRY_MAX_DELAY = 30.0
+MAX_RETRIES = 5
 NONCE_BATCH = 20_000      # hashes per event-loop yield while mining
 SYNC_INTERVAL = 5.0       # seconds between tip polls to teammates
 
@@ -55,10 +59,10 @@ class BlockchainCommunity(Community):
         self.member_keys: list[bytes] = settings.member_keys
         self.server_key: bytes = settings.server_key
 
-        self.chain: list[Block] = [genesis_block()]
-        self.block_pool: dict[bytes, Block] = {}        # valid blocks not (yet) on our chain
-        self.mempool: dict[bytes, Transaction] = {}
-        self.chain_tx_hashes: set[bytes] = set()
+        self.blockchain = Blockchain()
+        # item -> (last_requested_time, retry_count)
+        self.missing_block_requests: dict[int, tuple[float, int]] = {}
+        self.missing_tx_requests: dict[bytes, tuple[float, int]] = {}
 
         self.add_message_handler(SubmitTransaction, self.on_submit_transaction)
         self.add_message_handler(GetChainHeight, self.on_get_chain_height)
@@ -67,6 +71,7 @@ class BlockchainCommunity(Community):
         self.add_message_handler(ChainHeightResponse, self.on_chain_height_response)
         self.add_message_handler(NewBlockGossip, self.on_new_block)
         self.add_message_handler(TransactionGossip, self.on_transaction_gossip)
+        self.add_message_handler(GetTransaction, self.on_get_transaction)
 
         self.register_task("mine", self.mine_forever)
         self.register_task("sync", self.sync_with_teammates, interval=SYNC_INTERVAL)
@@ -83,16 +88,22 @@ class BlockchainCommunity(Community):
         return [p for p in self.get_peers() if self.is_member(p)]
 
     # --- server query handlers ----------------------------------------------
-
+    
     @lazy_wrapper(SubmitTransaction)
     def on_submit_transaction(self, peer: Peer, payload: SubmitTransaction) -> None:
         if not self.is_trusted(peer):
             return
         tx = Transaction(payload.sender_key, payload.data, payload.timestamp, payload.signature)
         if tx.verify():
-            self.accept_transaction(tx)
-            for member in self.member_peers():
-                self.ez_send(member, TransactionGossip(tx.sender_key, tx.data, tx.timestamp, tx.signature))
+            if self.blockchain.accept_transaction(tx):
+                # did this transaction change adoption status
+                missing = self.blockchain.try_adopt()
+                if missing is not None:
+                    self.remember_missing_block(missing, peer)
+
+                self.gossip_to_members(
+                    TransactionGossip(tx.sender_key, tx.data, tx.timestamp, tx.signature)
+                )
             self.ez_send(peer, SubmitTransactionResponse(True, tx.tx_hash, "accepted"))
             print(f"[tx] accepted {tx.tx_hash.hex()[:16]} from server")
         else:
@@ -103,17 +114,21 @@ class BlockchainCommunity(Community):
     def on_get_chain_height(self, peer: Peer, payload: GetChainHeight) -> None:
         if not self.is_trusted(peer):
             return
-        self.ez_send(peer, ChainHeightResponse(payload.request_id, len(self.chain) - 1,
-                                               self.chain[-1].block_hash))
+        self.ez_send(peer, ChainHeightResponse(payload.request_id, len(self.blockchain.chain) - 1,
+                                               self.blockchain.chain[-1].block_hash))
 
     @lazy_wrapper(GetBlock)
     def on_get_block(self, peer: Peer, payload: GetBlock) -> None:
-        if not self.is_trusted(peer) or not 0 <= payload.height < len(self.chain):
+        if not self.is_trusted(peer) or not 0 <= payload.height < len(self.blockchain.chain):
             return
-        block = self.chain[payload.height]
+        block = self.blockchain.chain[payload.height]
         self.ez_send(peer, BlockResponse(block.height, block.prev_hash, block.txs_hash,
                                          block.timestamp, block.difficulty, block.nonce,
                                          block.block_hash, b"".join(block.tx_hashes)))
+        
+    
+    def retry_delay(self, retries: int) -> float:
+        return min(RETRY_INITIAL_DELAY * (2 ** (retries - 1)), RETRY_MAX_DELAY)
 
     # --- intra-group messages -------------------------------------------------
 
@@ -122,8 +137,19 @@ class BlockchainCommunity(Community):
         if not self.is_member(peer):
             return
         tx = Transaction(payload.sender_key, payload.data, payload.timestamp, payload.signature)
-        if tx.verify():
-            self.accept_transaction(tx)
+
+        if not tx.verify():
+            return
+
+        if self.blockchain.accept_transaction(tx):
+            missing = self.blockchain.try_adopt()
+            if missing is not None:
+                self.remember_missing_block(missing, peer)
+
+            self.gossip_to_members(
+                TransactionGossip(tx.sender_key, tx.data, tx.timestamp, tx.signature),
+                exclude=peer,
+            )
 
     @lazy_wrapper(NewBlockGossip)
     def on_new_block(self, peer: Peer, payload: NewBlockGossip) -> None:
@@ -142,23 +168,78 @@ class BlockchainCommunity(Community):
     def sync_with_teammates(self) -> None:
         for member in self.member_peers():
             self.ez_send(member, GetChainHeight(random.getrandbits(63)))
+        
+        self.retry_missing_blocks()
+        self.retry_missing_transactions()
 
     @lazy_wrapper(ChainHeightResponse)
     def on_chain_height_response(self, peer: Peer, payload: ChainHeightResponse) -> None:
         """Periodic tip poll: if a teammate is ahead of us, fetch their tip block."""
         if not self.is_member(peer):
             return
-        if payload.height >= len(self.chain) - 1 and payload.tip_hash not in self.block_pool:
+        if payload.height >= len(self.blockchain.chain) - 1 and payload.tip_hash not in self.blockchain.block_pool:
             self.request_block(payload.height, peer)
 
+    @lazy_wrapper(GetTransaction)
+    def on_get_transaction(self, peer: Peer, payload: GetTransaction) -> None:
+        if not self.is_member(peer):
+            return
+
+        tx = self.blockchain.mempool.get(payload.tx_hash)
+        if tx is None:
+            return
+        
+        self.ez_send(
+            peer,
+            TransactionGossip(tx.sender_key, tx.data, tx.timestamp, tx.signature),
+        )
+
+    def retry_missing_transactions(self) -> None:
+        now = time.time()
+
+        for tx_hash, (last_requested, retries) in list(self.missing_tx_requests.items()):
+            if tx_hash in self.blockchain.mempool or tx_hash in self.blockchain.chain_tx_hashes:
+                del self.missing_tx_requests[tx_hash]
+                continue
+
+            if retries >= MAX_RETRIES:
+                del self.missing_tx_requests[tx_hash]
+                continue
+
+            if now - last_requested >= self.retry_delay(retries):
+                self.request_transactions([tx_hash])
+                self.missing_tx_requests[tx_hash] = (now, retries + 1)
+
+    def retry_missing_blocks(self) -> None:
+        now = time.time()
+
+        for height, (last_requested, retries) in list(self.missing_block_requests.items()):
+
+            # Already caught up
+            if height <= self.blockchain.height:
+                del self.missing_block_requests[height]
+                continue
+
+            # Give up eventually
+            if retries >= MAX_RETRIES:
+                print(f"[sync] giving up on block {height}")
+                del self.missing_block_requests[height]
+                continue
+
+            # Not time yet
+            if now - last_requested < self.retry_delay(retries):
+                continue
+
+            print(f"[sync] retrying block {height} (attempt {retries + 1})")
+
+            self.request_block(height)
+
+            self.missing_block_requests[height] = (
+                now,
+                retries + 1,
+            )
+
     # --- chain state ----------------------------------------------------------
-
-    def accept_transaction(self, tx: Transaction) -> None:
-        if tx.tx_hash not in self.mempool:
-            self.mempool[tx.tx_hash] = tx
-
-    def pending_tx_hashes(self) -> list[bytes]:
-        return [txh for txh in self.mempool if txh not in self.chain_tx_hashes]
 
     def handle_block(self, peer: Peer, height: int, prev_hash: bytes, txs_hash: bytes,
                      timestamp: int, difficulty: int, nonce: int, tx_hashes_blob: bytes) -> None:
@@ -168,58 +249,67 @@ class BlockchainCommunity(Community):
         # Recompute the hash from the header; never trust a received block_hash.
         block_hash = sha256(pack_header(prev_hash, txs_hash, timestamp, difficulty, nonce)).digest()
         block = Block(height, prev_hash, txs_hash, timestamp, difficulty, nonce, block_hash, tx_hashes)
-        if block.block_hash in self.block_pool or not block.is_internally_valid():
+
+        accepted, missing, missing_txs = self.blockchain.add_block(block)
+
+        if missing is not None:
+            self.remember_missing_block(missing, peer)
+
+        if missing_txs:
+            self.remember_missing_transactions(missing_txs, peer)
             return
-        self.block_pool[block.block_hash] = block
-        self.try_adopt(peer)
 
-    def try_adopt(self, peer: Peer | None = None) -> None:
-        """Adopt the best chain reachable through pooled blocks; request missing parents."""
-        for block in sorted(self.block_pool.values(), key=lambda b: (-b.height, b.block_hash)):
-            if block.height <= len(self.chain) - 1 and \
-                    self.chain[block.height].block_hash == block.block_hash:
-                continue  # already on our chain
-            branch, fork_point, missing = self.trace_branch(block)
-            if fork_point is None:
-                if missing is not None:
-                    self.request_block(missing, peer)
+        if accepted:
+            self.missing_block_requests.pop(block.height, None)
+            print(f"[block] accepted {block.block_hash.hex()[:16]}")
+
+    def remember_missing_block(self, height: int, peer: Peer | None = None) -> None:
+        if height in self.missing_block_requests:
+            return
+
+        self.missing_block_requests[height] = (
+            time.time(),  # first request time
+            1,            # retry count
+        )
+
+        self.request_block(height, peer)
+
+    def remember_missing_transactions(
+        self,
+        tx_hashes: list[bytes],
+        peer: Peer | None = None,
+    ) -> None:
+        now = time.time()
+        new_missing = []
+
+        for tx_hash in tx_hashes:
+            if tx_hash in self.missing_tx_requests:
                 continue
-            tip = self.chain[-1]
-            longer = block.height > tip.height
-            tie_win = block.height == tip.height and block.block_hash < tip.block_hash
-            if longer or tie_win:
-                self.chain = self.chain[:fork_point + 1] + list(reversed(branch))
-                self.chain_tx_hashes = {txh for b in self.chain for txh in b.tx_hashes}
-                print(f"[chain] height {block.height}, tip {block.block_hash.hex()[:16]} "
-                        f"(fork point {fork_point})")
-                break
-        # keep the pool small
-        cutoff = len(self.chain) - 10
-        for block_hash in [h for h, b in self.block_pool.items() if b.height < cutoff]:
-            del self.block_pool[block_hash]
 
-    def trace_branch(self, block: Block):
-        """Walk prev_hash links from `block` down to our chain.
+            self.missing_tx_requests[tx_hash] = (now, 1)
+            new_missing.append(tx_hash)
 
-        Returns (branch tip->child-of-fork-point, fork_point height, missing height).
-        """
-        branch = []
-        cur = block
-        while True:
-            branch.append(cur)
-            parent_height = cur.height - 1
-            if parent_height < len(self.chain) and \
-                    self.chain[parent_height].block_hash == cur.prev_hash:
-                return branch, parent_height, None
-            parent = self.block_pool.get(cur.prev_hash)
-            if parent is None or parent.height != parent_height:
-                return branch, None, parent_height if parent_height >= 1 else None
-            cur = parent
+        if new_missing:
+            self.request_transactions(new_missing, peer)
 
     def request_block(self, height: int, peer: Peer | None = None) -> None:
         targets = [peer] if peer is not None and self.is_member(peer) else self.member_peers()
         for target in targets:
             self.ez_send(target, GetBlock(height))
+
+    def request_transactions(self, tx_hashes: list[bytes], peer: Peer | None = None) -> None:
+        targets = [peer] if peer is not None and self.is_member(peer) else self.member_peers()
+
+        for tx_hash in tx_hashes:
+            for target in targets:
+                self.ez_send(target, GetTransaction(tx_hash))
+        
+    def gossip_to_members(self, payload, exclude: Peer | None = None) -> None:
+        for member in self.member_peers():
+            if exclude is not None and member == exclude:
+                continue
+            self.ez_send(member, payload)
+            
 
     # --- mining ---------------------------------------------------------------
 
@@ -230,9 +320,9 @@ class BlockchainCommunity(Community):
 
     async def mine_one_block(self) -> None:
         """Mine on the current tip; bail out when the tip or the mempool changes."""
-        tip = self.chain[-1]
-        height = len(self.chain)
-        pending = self.pending_tx_hashes()
+        tip = self.blockchain.chain[-1]
+        height = len(self.blockchain.chain)
+        pending = self.blockchain.pending_tx_hashes()
         txs_hash = txs_commitment(pending)
         timestamp = int(time.time())
         prefix = tip.block_hash + txs_hash + timestamp.to_bytes(8, "big") + DIFFICULTY.to_bytes(4, "big")
@@ -248,22 +338,33 @@ class BlockchainCommunity(Community):
                     return
                 nonce = (nonce + 1) & NONCE_MASK
             await asyncio.sleep(0)
-            if self.chain[-1] is not tip or self.pending_tx_hashes() != pending:
+            if self.blockchain.chain[-1] is not tip or self.blockchain.pending_tx_hashes() != pending:
                 return  # restart on the new tip / with the new transactions
 
     def adopt_own_block(self, block: Block) -> None:
-        self.block_pool[block.block_hash] = block
+        accepted, missing, missing_txs = self.blockchain.add_block(block)
 
-        tip = self.chain[-1]
-        if block.prev_hash == tip.block_hash:
-            self.chain.append(block)
-            self.chain_tx_hashes.update(block.tx_hashes)
-        else:
-            self.try_adopt()  # prevent race condition where we adopted a block during the mining process
+        if missing is not None:
+            self.remember_missing_block(missing)
+
+        if missing_txs:
+            self.remember_missing_transactions(missing_txs)
+            return
+
+        if not accepted:
+            return
 
         print(f"[mine] found block {block.height} {block.block_hash.hex()[:16]} "
-              f"({len(block.tx_hashes)} txs)")
-        gossip = NewBlockGossip(block.height, block.prev_hash, block.txs_hash, block.timestamp,
-                                block.difficulty, block.nonce, b"".join(block.tx_hashes))
-        for member in self.member_peers():
-            self.ez_send(member, gossip)
+            f"({len(block.tx_hashes)} txs)")
+
+        gossip = NewBlockGossip(
+            block.height,
+            block.prev_hash,
+            block.txs_hash,
+            block.timestamp,
+            block.difficulty,
+            block.nonce,
+            b"".join(block.tx_hashes),
+        )
+
+        self.gossip_to_members(gossip)

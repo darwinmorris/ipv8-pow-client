@@ -23,4 +23,9 @@ build/
 dist/
 *.egg-info/
 
-.env
+.env*
+
+docker*
+Docker*
+
+*.pem
