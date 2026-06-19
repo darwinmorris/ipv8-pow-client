@@ -39,6 +39,9 @@ from lab3.payloads import (
     GetTransaction,
 )
 
+RETRY_INITIAL_DELAY = 2.0
+RETRY_MAX_DELAY = 30.0
+MAX_RETRIES = 5
 NONCE_BATCH = 20_000      # hashes per event-loop yield while mining
 SYNC_INTERVAL = 5.0       # seconds between tip polls to teammates
 
@@ -58,6 +61,9 @@ class BlockchainCommunity(Community):
         self.server_key: bytes = settings.server_key
 
         self.blockchain = Blockchain()
+        # item -> (last_requested_time, retry_count)
+        self.missing_block_requests: dict[int, tuple[float, int]] = {}
+        self.missing_tx_requests: dict[bytes, tuple[float, int]] = {}
 
         self.add_message_handler(SubmitTransaction, self.on_submit_transaction)
         self.add_message_handler(GetChainHeight, self.on_get_chain_height)
@@ -115,6 +121,10 @@ class BlockchainCommunity(Community):
         self.ez_send(peer, BlockResponse(block.height, block.prev_hash, block.txs_hash,
                                          block.timestamp, block.difficulty, block.nonce,
                                          block.block_hash, b"".join(block.tx_hashes)))
+        
+    
+    def retry_delay(self, retries: int) -> float:
+        return min(RETRY_INITIAL_DELAY * (2 ** (retries - 1)), RETRY_MAX_DELAY)
 
     # --- intra-group messages -------------------------------------------------
 
@@ -150,6 +160,9 @@ class BlockchainCommunity(Community):
     def sync_with_teammates(self) -> None:
         for member in self.member_peers():
             self.ez_send(member, GetChainHeight(random.getrandbits(63)))
+        
+        self.retry_missing_blocks()
+        self.retry_missing_transactions()
 
     @lazy_wrapper(ChainHeightResponse)
     def on_chain_height_response(self, peer: Peer, payload: ChainHeightResponse) -> None:
@@ -173,6 +186,51 @@ class BlockchainCommunity(Community):
             TransactionGossip(tx.sender_key, tx.data, tx.timestamp, tx.signature),
         )
 
+    def retry_missing_transactions(self) -> None:
+        now = time.time()
+
+        for tx_hash, (last_requested, retries) in list(self.missing_tx_requests.items()):
+            if tx_hash in self.blockchain.mempool or tx_hash in self.blockchain.chain_tx_hashes:
+                del self.missing_tx_requests[tx_hash]
+                continue
+
+            if retries >= MAX_RETRIES:
+                del self.missing_tx_requests[tx_hash]
+                continue
+
+            if now - last_requested >= self.retry_delay(retries):
+                self.request_transactions([tx_hash])
+                self.missing_tx_requests[tx_hash] = (now, retries + 1)
+
+    def retry_missing_blocks(self) -> None:
+        now = time.time()
+
+        for height, (last_requested, retries) in list(self.missing_block_requests.items()):
+
+            # Already caught up
+            if height <= self.blockchain.height:
+                del self.missing_block_requests[height]
+                continue
+
+            # Give up eventually
+            if retries >= MAX_RETRIES:
+                print(f"[sync] giving up on block {height}")
+                del self.missing_block_requests[height]
+                continue
+
+            # Not time yet
+            if now - last_requested < self.retry_delay(retries):
+                continue
+
+            print(f"[sync] retrying block {height} (attempt {retries + 1})")
+
+            self.request_block(height)
+
+            self.missing_block_requests[height] = (
+                now,
+                retries + 1,
+            )
+
     # --- chain state ----------------------------------------------------------
 
     def handle_block(self, peer: Peer, height: int, prev_hash: bytes, txs_hash: bytes,
@@ -184,35 +242,47 @@ class BlockchainCommunity(Community):
         block_hash = sha256(pack_header(prev_hash, txs_hash, timestamp, difficulty, nonce)).digest()
         block = Block(height, prev_hash, txs_hash, timestamp, difficulty, nonce, block_hash, tx_hashes)
 
-        accepted, missing, missing_txs = self.blockchain.add_block(block) # need to handle missing here
+        accepted, missing, missing_txs = self.blockchain.add_block(block)
 
         if missing is not None:
-            self.request_block(missing, peer)
+            self.remember_missing_block(missing, peer)
 
         if missing_txs:
-            self.request_transactions(missing_txs, peer)
+            self.remember_missing_transactions(missing_txs, peer)
             return
-        
+
         if accepted:
+            self.missing_block_requests.pop(block.height, None)
             print(f"[block] accepted {block.block_hash.hex()[:16]}")
 
-    def trace_branch(self, block: Block):
-        """Walk prev_hash links from `block` down to our chain.
+    def remember_missing_block(self, height: int, peer: Peer | None = None) -> None:
+        if height in self.missing_block_requests:
+            return
 
-        Returns (branch tip->child-of-fork-point, fork_point height, missing height).
-        """
-        branch = []
-        cur = block
-        while True:
-            branch.append(cur)
-            parent_height = cur.height - 1
-            if parent_height < len(self.blockchain.chain) and \
-                    self.blockchain.chain[parent_height].block_hash == cur.prev_hash:
-                return branch, parent_height, None
-            parent = self.blockchain.block_pool.get(cur.prev_hash)
-            if parent is None or parent.height != parent_height:
-                return branch, None, parent_height if parent_height >= 1 else None
-            cur = parent
+        self.missing_block_requests[height] = (
+            time.time(),  # first request time
+            1,            # retry count
+        )
+
+        self.request_block(height, peer)
+
+    def remember_missing_transactions(
+        self,
+        tx_hashes: list[bytes],
+        peer: Peer | None = None,
+    ) -> None:
+        now = time.time()
+        new_missing = []
+
+        for tx_hash in tx_hashes:
+            if tx_hash in self.missing_tx_requests:
+                continue
+
+            self.missing_tx_requests[tx_hash] = (now, 1)
+            new_missing.append(tx_hash)
+
+        if new_missing:
+            self.request_transactions(new_missing, peer)
 
     def request_block(self, height: int, peer: Peer | None = None) -> None:
         targets = [peer] if peer is not None and self.is_member(peer) else self.member_peers()
@@ -265,10 +335,14 @@ class BlockchainCommunity(Community):
                 return  # restart on the new tip / with the new transactions
 
     def adopt_own_block(self, block: Block) -> None:
-        accepted, missing = self.blockchain.add_block(block)
+        accepted, missing, missing_txs = self.blockchain.add_block(block)
 
         if missing is not None:
-            self.request_block(missing)
+            self.remember_missing_block(missing)
+
+        if missing_txs:
+            self.remember_missing_transactions(missing_txs)
+            return
 
         if not accepted:
             return

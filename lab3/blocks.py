@@ -16,6 +16,10 @@ NONCE_MASK = (1 << 63) - 1
 # a new block every few seconds, fast enough to bury the test transaction.
 DIFFICULTY = 25
 
+RETRY_INITIAL_DELAY = 2.0
+RETRY_MAX_DELAY = 30.0
+MAX_RETRIES = 5
+
 
 def pack_header(prev_hash: bytes, txs_hash: bytes, timestamp: int, difficulty: int, nonce: int) -> bytes:
     """84-byte header: prev_hash | txs_hash | timestamp(8be) | difficulty(4be) | nonce(8be)."""
@@ -107,6 +111,7 @@ class Blockchain:
         self.block_pool: dict[bytes, Block] = {}
         self.mempool: dict[bytes, Transaction] = {}
         self.chain_tx_hashes: set[bytes] = set()
+       
 
     @property
     def height(self) -> int:
