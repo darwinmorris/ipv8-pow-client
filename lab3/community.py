@@ -15,7 +15,7 @@ from ipv8.community import Community, CommunitySettings
 from ipv8.lazy_community import lazy_wrapper
 from ipv8.peer import Peer
 
-from blocks import (
+from lab3.blocks import (
     DIFFICULTY,
     HASH_SIZE,
     NONCE_MASK,
@@ -27,7 +27,7 @@ from blocks import (
     pack_header,
     txs_commitment,
 )
-from payloads import (
+from lab3.payloads import (
     BlockResponse,
     ChainHeightResponse,
     GetBlock,
@@ -36,6 +36,7 @@ from payloads import (
     SubmitTransaction,
     SubmitTransactionResponse,
     TransactionGossip,
+    GetTransaction,
 )
 
 NONCE_BATCH = 20_000      # hashes per event-loop yield while mining
@@ -65,6 +66,7 @@ class BlockchainCommunity(Community):
         self.add_message_handler(ChainHeightResponse, self.on_chain_height_response)
         self.add_message_handler(NewBlockGossip, self.on_new_block)
         self.add_message_handler(TransactionGossip, self.on_transaction_gossip)
+        self.add_message_handler(GetTransaction, self.on_get_transaction)
 
         self.register_task("mine", self.mine_forever)
         self.register_task("sync", self.sync_with_teammates, interval=SYNC_INTERVAL)
@@ -157,6 +159,20 @@ class BlockchainCommunity(Community):
         if payload.height >= len(self.blockchain.chain) - 1 and payload.tip_hash not in self.blockchain.block_pool:
             self.request_block(payload.height, peer)
 
+    @lazy_wrapper(GetTransaction)
+    def on_get_transaction(self, peer: Peer, payload: GetTransaction) -> None:
+        if not self.is_member(peer):
+            return
+
+        tx = self.blockchain.mempool.get(payload.tx_hash)
+        if tx is None:
+            return
+
+        self.ez_send(
+            peer,
+            TransactionGossip(tx.sender_key, tx.data, tx.timestamp, tx.signature),
+        )
+
     # --- chain state ----------------------------------------------------------
 
     def handle_block(self, peer: Peer, height: int, prev_hash: bytes, txs_hash: bytes,
@@ -167,10 +183,15 @@ class BlockchainCommunity(Community):
         # Recompute the hash from the header; never trust a received block_hash.
         block_hash = sha256(pack_header(prev_hash, txs_hash, timestamp, difficulty, nonce)).digest()
         block = Block(height, prev_hash, txs_hash, timestamp, difficulty, nonce, block_hash, tx_hashes)
-        accepted, missing = self.blockchain.add_block(block) # need to handle missing here
+
+        accepted, missing, missing_txs = self.blockchain.add_block(block) # need to handle missing here
 
         if missing is not None:
             self.request_block(missing, peer)
+
+        if missing_txs:
+            self.request_transactions(missing_txs, peer)
+            return
         
         if accepted:
             print(f"[block] accepted {block.block_hash.hex()[:16]}")
@@ -197,12 +218,21 @@ class BlockchainCommunity(Community):
         targets = [peer] if peer is not None and self.is_member(peer) else self.member_peers()
         for target in targets:
             self.ez_send(target, GetBlock(height))
+
     
+    def request_transactions(self, tx_hashes: list[bytes], peer: Peer | None = None) -> None:
+        targets = [peer] if peer is not None and self.is_member(peer) else self.member_peers()
+
+        for tx_hash in tx_hashes:
+            for target in targets:
+                self.ez_send(target, GetTransaction(tx_hash))
+        
     def gossip_to_members(self, payload, exclude: Peer | None = None) -> None:
         for member in self.member_peers():
             if exclude is not None and member == exclude:
                 continue
             self.ez_send(member, payload)
+            
 
     # --- mining ---------------------------------------------------------------
 

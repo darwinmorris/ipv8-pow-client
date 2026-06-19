@@ -1,6 +1,6 @@
 """Unit tests for multi-miner chain adoption.
 
-Run with: python test_blockchain.py
+Run with: PYTHONPATH=. pytest test/lab3/test_blockchain.py
 """
 
 from __future__ import annotations
@@ -12,31 +12,50 @@ from ipv8.peer import Peer
 from ipv8.peerdiscovery.network import Network
 from ipv8.test.mocking.endpoint import AutoMockEndpoint
 
-from community import BlockchainCommunity, BlockchainSettings
-from blocks import genesis_block, make_block, meets_difficulty
+from lab3.blocks import genesis_block, make_block, meets_difficulty
+from lab3.community import BlockchainCommunity, BlockchainSettings
+
+BlockchainCommunity.community_id = b"\xab" * 20
 
 AHEAD_BY = 5
-TEST_DIFFICULTY = 8  # fast enough for unit tests; real nodes use blocks.DIFFICULTY
+TEST_DIFFICULTY = 8
 
 
 def mine_chain(length: int, difficulty: int = TEST_DIFFICULTY) -> list:
     """Return a valid chain [genesis, block1, ..., block(length-1)]."""
     chain = [genesis_block()]
+
     for height in range(1, length):
         prev = chain[-1]
         nonce = 0
+
         while True:
-            block = make_block(height, prev.block_hash, [], 1_718_000_000 + height, difficulty, nonce)
+            block = make_block(
+                height,
+                prev.block_hash,
+                [],
+                1_718_000_000 + height,
+                difficulty,
+                nonce,
+            )
+
             if meets_difficulty(block.block_hash, difficulty):
                 chain.append(block)
                 break
+
             nonce += 1
+
     return chain
 
 
-def make_community(member_keys: list[bytes], private_keys: list, my_index: int) -> BlockchainCommunity:
+def make_community(
+    member_keys: list[bytes],
+    private_keys: list,
+    my_index: int,
+) -> BlockchainCommunity:
     endpoint = AutoMockEndpoint()
     endpoint.open()
+
     settings = BlockchainSettings(
         endpoint=endpoint,
         network=Network(),
@@ -44,18 +63,24 @@ def make_community(member_keys: list[bytes], private_keys: list, my_index: int) 
         member_keys=member_keys,
         server_key=b"",
     )
+
     with patch.object(BlockchainCommunity, "register_task"):
         community = BlockchainCommunity(settings)
+
     community.my_estimated_wan = endpoint.wan_address
     community.my_estimated_lan = endpoint.lan_address
+
     return community
 
 
 def install_chain(community: BlockchainCommunity, chain: list) -> None:
-    community.chain = list(chain)
-    community.chain_tx_hashes = {txh for block in chain for txh in block.tx_hashes}
+    community.blockchain.chain = list(chain)
+    community.blockchain.chain_tx_hashes = {
+        txh for block in chain for txh in block.tx_hashes
+    }
+
     for block in chain:
-        community.block_pool[block.block_hash] = block
+        community.blockchain.block_pool[block.block_hash] = block
 
 
 def connect_members(communities: list[BlockchainCommunity]) -> None:
@@ -63,6 +88,7 @@ def connect_members(communities: list[BlockchainCommunity]) -> None:
         for right in communities:
             if left is right:
                 continue
+
             peer = Peer(right.my_peer.public_key, right.endpoint.wan_address)
             left.network.add_verified_peer(peer)
 
@@ -89,7 +115,7 @@ def serve_blocks_from(leader: BlockchainCommunity, follower: BlockchainCommunity
     leader_peer = peer_for(leader)
 
     def answer_request(height: int, peer: Peer | None = None) -> None:
-        gossip_block(follower, leader_peer, leader.chain[height])
+        gossip_block(follower, leader_peer, leader.blockchain.chain[height])
 
     follower.request_block = answer_request  # type: ignore[method-assign]
 
@@ -108,40 +134,42 @@ def test_lagging_miners_adopt_longer_chain():
 
     leader_chain = mine_chain(1 + AHEAD_BY)
     install_chain(leader, leader_chain)
-    assert len(follower_a.chain) == 1
-    assert len(follower_b.chain) == 1
+
+    assert len(follower_a.blockchain.chain) == 1
+    assert len(follower_b.blockchain.chain) == 1
 
     leader_peer = peer_for(leader)
+
     for block in leader_chain[1:]:
         gossip_block(follower_a, leader_peer, block)
         gossip_block(follower_b, leader_peer, block)
 
     for follower in (follower_a, follower_b):
-        assert len(follower.chain) == len(leader_chain)
+        assert len(follower.blockchain.chain) == len(leader_chain)
+
         for height, expected in enumerate(leader_chain):
-            assert follower.chain[height].block_hash == expected.block_hash
+            assert follower.blockchain.chain[height].block_hash == expected.block_hash
 
 
 def test_lagging_miner_catches_up_via_height_sync():
     """A miner behind by several blocks catches up when it polls a taller teammate."""
-    _keys, _private_keys, (leader, follower, _other) = make_miners()
-    connect_members([leader, follower, _other])
+    _keys, _private_keys, (leader, follower, other) = make_miners()
+    connect_members([leader, follower, other])
 
     leader_chain = mine_chain(1 + AHEAD_BY)
     install_chain(leader, leader_chain)
     serve_blocks_from(leader, follower)
 
-    # Mirrors what happens after sync sees a teammate several blocks ahead.
     follower.request_block(leader_chain[-1].height, peer_for(leader))
 
-    assert len(follower.chain) == len(leader_chain)
-    assert follower.chain[-1].block_hash == leader_chain[-1].block_hash
+    assert len(follower.blockchain.chain) == len(leader_chain)
+    assert follower.blockchain.chain[-1].block_hash == leader_chain[-1].block_hash
 
 
 def test_lagging_miner_adopts_when_tip_arrives_first():
     """Receiving the tip before its parents still ends on the longer chain."""
-    _keys, _private_keys, (leader, follower, _other) = make_miners()
-    connect_members([leader, follower, _other])
+    _keys, _private_keys, (leader, follower, other) = make_miners()
+    connect_members([leader, follower, other])
 
     leader_chain = mine_chain(1 + AHEAD_BY)
     install_chain(leader, leader_chain)
@@ -149,14 +177,16 @@ def test_lagging_miner_adopts_when_tip_arrives_first():
 
     gossip_block(follower, peer_for(leader), leader_chain[-1])
 
-    assert len(follower.chain) == len(leader_chain)
-    assert follower.chain[-1].block_hash == leader_chain[-1].block_hash
+    assert len(follower.blockchain.chain) == len(leader_chain)
+    assert follower.blockchain.chain[-1].block_hash == leader_chain[-1].block_hash
 
 
 if __name__ == "__main__":
     BlockchainCommunity.community_id = b"\xab" * 20
+
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
             fn()
             print(f"ok  {name}")
+
     print("all tests passed")

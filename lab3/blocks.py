@@ -129,34 +129,50 @@ class Blockchain:
     def pending_tx_hashes(self) -> list[bytes]:
         return [txh for txh in self.mempool if txh not in self.chain_tx_hashes]
 
-    def validate_block_transactions(self, block: Block) -> bool:
+    def validate_block_transactions(self, block: Block) -> tuple[bool, list[bytes]]:
         if len(block.tx_hashes) != len(set(block.tx_hashes)):
-            return False
-    
+            return False, []
+
+        missing_txs = []
+
         for tx_hash in block.tx_hashes:
+            if tx_hash in self.chain_tx_hashes:
+                return False, []
+
             tx = self.mempool.get(tx_hash)
 
             if tx is None:
-                return False
+                missing_txs.append(tx_hash)
+                continue
 
             if not tx.verify():
-                return False
+                return False, []
 
-        return True
+        if missing_txs:
+            return False, missing_txs
 
-    def add_block(self, block: Block) -> tuple[bool, int | None]:
+        return True, []
+
+
+    def add_block(self, block: Block) -> tuple[bool, int | None, list[bytes]]:
         if block.block_hash in self.block_pool:
-            return False, None
+            return False, None, []
 
         if not block.is_internally_valid():
-            return False, None
+            return False, None, []
 
-        if not self.validate_block_transactions(block):
-            return False, None
+        txs_valid, missing_txs = self.validate_block_transactions(block)
+
+        if not txs_valid:
+            return False, None, []
 
         self.block_pool[block.block_hash] = block
-        missing = self.try_adopt()
-        return True, missing
+
+        if missing_txs:
+            return False, None, missing_txs
+        
+        missing_block = self.try_adopt()
+        return True, missing_block, []
 
     def try_adopt(self) -> int | None:
         missing_height = None

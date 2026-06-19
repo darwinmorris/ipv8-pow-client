@@ -86,9 +86,15 @@ class TransactionGossip(DataClassPayload[8]):
     signature: bytes
 
 
+@dataclass
+class GetTransaction(DataClassPayload[9]):
+    tx_hash: bytes
+
+
 # DataClassPayload registers its wire format on first instantiation, which must
 # happen before the first inbound packet of that type is unpacked.
 for _cls in (RegisterBlockchain, RegisterResponse, SubmitTransaction,
              SubmitTransactionResponse, GetChainHeight, ChainHeightResponse,
-             GetBlock, BlockResponse, NewBlockGossip, TransactionGossip):
+             GetBlock, BlockResponse, NewBlockGossip, TransactionGossip,
+             GetTransaction):
     _cls(*([None] * len(_cls.__dataclass_fields__)))
