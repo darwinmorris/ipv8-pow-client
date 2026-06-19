@@ -8,7 +8,7 @@ from hashlib import sha256
 from ipv8.keyvault.crypto import default_eccrypto
 from ipv8.messaging.serialization import default_serializer
 
-from lab3.blocks import (
+from src.blocks import (
     Block,
     Blockchain,
     Transaction,
@@ -19,7 +19,7 @@ from lab3.blocks import (
     pack_header,
     txs_commitment,
 )
-from lab3.payloads import BlockResponse, GetTransaction, SubmitTransaction
+from src.payloads import BlockResponse, GetTransaction, SubmitTransaction
 
 
 def make_signed_tx(data: bytes = b"hello lab3", timestamp: int = 1718000000) -> Transaction:

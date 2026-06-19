@@ -1,5 +1,31 @@
 # Design Overview
 
+## Requirements
+
+- Python 3.12+
+- Dependencies managed through `pyproject.toml`
+
+## Installation
+
+Create a virtual environment and install the project:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+
+pip install -e .
+```
+
+## Running
+```
+python main.py --key ec_multichain.pem
+```
+
+## Testing
+```
+pytest
+```
+
 ## Architecture
 
 The system implements a proof-of-work blockchain using IPv8 peer-to-peer communication. Three miner nodes participate in a private blockchain network and concurrently mine blocks containing transactions submitted by a trusted server.
@@ -130,4 +156,5 @@ The implementation includes:
 - Chain adoption tests
 - Fork recovery tests
 
-The tests verify that lagging miners correctly synchronize with peers and eventually converge on the same active chain.
+The tests verify that lagging miners correctly synchronize with peers and eventually converge on the same active chain. Tests are visible in the github actions pipeline.
+

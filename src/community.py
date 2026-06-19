@@ -15,7 +15,7 @@ from ipv8.community import Community, CommunitySettings
 from ipv8.lazy_community import lazy_wrapper
 from ipv8.peer import Peer
 
-from lab3.blocks import (
+from src.blocks import (
     DIFFICULTY,
     HASH_SIZE,
     NONCE_MASK,
@@ -26,7 +26,7 @@ from lab3.blocks import (
     pack_header,
     txs_commitment,
 )
-from lab3.payloads import (
+from src.payloads import (
     BlockResponse,
     ChainHeightResponse,
     GetBlock,

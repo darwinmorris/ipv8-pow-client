@@ -27,9 +27,9 @@ from ipv8.lazy_community import lazy_wrapper
 from ipv8.peer import Peer
 from ipv8_service import IPv8
 
-from lab3.blocks import leading_zero_bits, pack_header
-from lab3.main import derive_community_id
-from lab3.payloads import (
+from src.blocks import leading_zero_bits, pack_header
+from src.main import derive_community_id
+from src.payloads import (
     BlockResponse,
     ChainHeightResponse,
     GetBlock,

@@ -28,8 +28,8 @@ from ipv8.configuration import ConfigBuilder, Strategy, WalkerDefinition, defaul
 from ipv8.util import run_forever
 from ipv8_service import IPv8
 
-from lab3.community import BlockchainCommunity
-from lab3.registration import SERVER_PUBLIC_KEY, RegistrationCommunity
+from src.community import BlockchainCommunity
+from src.registration import SERVER_PUBLIC_KEY, RegistrationCommunity
 
 KEY_ALIAS = "lab3 identity"
 

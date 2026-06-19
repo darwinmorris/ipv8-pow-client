@@ -8,7 +8,7 @@ from ipv8.community import Community, CommunitySettings
 from ipv8.lazy_community import lazy_wrapper
 from ipv8.peer import Peer
 
-from lab3.payloads import RegisterBlockchain, RegisterResponse
+from src.payloads import RegisterBlockchain, RegisterResponse
 
 REGISTRATION_COMMUNITY_ID = bytes.fromhex("4c616233426c6f636b636861696e323032365057")
 SERVER_PUBLIC_KEY = bytes.fromhex(
