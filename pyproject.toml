@@ -9,6 +9,7 @@ dependencies = [
     "libnacl>=2.1.0",
     "pyipv8>=3.2.0",
     "pytest>=9.0.3",
+    "python-dotenv"
 ]
 
 [tool.pytest.ini_options]
