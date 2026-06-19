@@ -1,34 +1,133 @@
-# Design Overview 
+# Design Overview
+
 ## Architecture
-The system implements a simple proof-of-work blockchain using IPv8 peer-to-peer communication. Miner nodes participate in the network and concurrently mine blocks containing transactions submitted by a trusted server.
 
-Each node maintains:
-- A local blockchain
+The system implements a proof-of-work blockchain using IPv8 peer-to-peer communication. Three miner nodes participate in a private blockchain network and concurrently mine blocks containing transactions submitted by a trusted server.
+
+The implementation is split into two main components:
+
+### Blockchain
+
+The `Blockchain` class manages all blockchain state and validation logic. It maintains:
+
+- The active blockchain
 - A mempool of pending transactions
-- A pool of known blocks not yet on the chain
+- A block pool containing known blocks
+- A set of transaction hashes already included in the active chain
 
-Transactions are propagated between miners using gossip messages, while blocks are disseminated immediately after being mined. Upon receiving a transaction a node gossips about it to peers to synchronize mempools.
+The blockchain component is responsible for:
+
+- Transaction acceptance and deduplication
+- Block validation
+- Fork resolution
+- Chain adoption
+- Reconstruction of the active chain
+
+### Blockchain Community
+
+The `BlockchainCommunity` class handles all network communication through IPv8. It is responsible for:
+
+- Transaction gossip
+- Block gossip
+- Chain synchronization
+- Missing block recovery
+- Missing transaction recovery
+- Mining coordination
+
+This separation keeps blockchain state management independent from networking concerns.
+
+## Transactions
+
+Transactions are received from a trusted server and verified using IPv8 public-key signatures.
+
+Before entering the mempool a transaction must:
+
+1. Have a valid signature.
+2. Not already be present in the active chain.
+3. Not already exist in the mempool.
+
+Accepted transactions are propagated to all peers using gossip messages. This allows miners to maintain similar mempool contents and mine compatible blocks.
+
+## Blocks
+
+A block contains:
+
+- Height
+- Previous block hash
+- Transaction commitment hash
+- Timestamp
+- Difficulty
+- Nonce
+- Block hash
+- Transaction hash list
+
+Blocks are validated by checking:
+
+1. The block hash matches the block header.
+2. The proof-of-work satisfies the declared difficulty.
+3. The transaction commitment matches the transaction list.
+4. Referenced transactions are known and valid.
+5. No duplicate transaction hashes appear within the block.
+
+Only valid blocks are added to the block pool.
+
+## Mining
+
+All nodes mine concurrently.
+
+Mining is performed on top of the current chain tip using the set of pending transactions currently present in the mempool.
+
+To reduce duplicate work between miners, each miner begins searching from a random nonce value and then searches sequentially.
+
+If the local chain tip changes or the mempool contents change while mining, the current mining attempt is abandoned and restarted using the updated state.
+
+When a valid proof-of-work is found, the block is added locally and immediately propagated to peers.
 
 ## Consensus
+
 Nodes follow a longest-chain consensus protocol.
 
-On receiving a block:
-- Block header and PoW are validated
-- Block is stored in the local block pool.
-- The node attempts to reconstruct the best chain reachable through known blocks.
-- The longest valid chain is selected as the active chain
+When a block is received it is first validated and stored in the local block pool. The node then attempts to reconstruct the best chain reachable through all known blocks.
 
+A chain is adopted when:
 
-If two chains have equal height, ties are broken deterministically by selecting the chain whose tip block has the smaller hash value. This ensures that all nodes eventually converge on the same chain.
+- It is strictly longer than the current chain, or
+- It has the same height but a smaller tip block hash.
 
-## Synchronization 
-Nodes periodically exchange chain height information. If a larger chain is detected blocks are requested.
+The second rule provides deterministic tie-breaking and ensures eventual convergence after temporary forks.
 
+## Fork Handling
 
-## TODO
-- Request multiple blocks at once?
-- re-gossip transactions
-- Better active sync for mempools?
-- Request complete transaction data
+Blocks are not required to arrive in order.
 
+The block pool stores blocks that are not currently part of the active chain. This includes:
 
+- Competing fork branches
+- Newly received blocks whose parents are not yet known
+- Future candidates for chain adoption
+
+When a better chain becomes available, the node reconstructs the branch from the block pool and switches to the new chain.
+
+## Synchronization
+
+Nodes periodically exchange chain height information.
+
+If a peer advertises a chain height that exceeds the local height, the node requests the corresponding block and attempts to reconstruct the missing portion of the chain.
+
+When a block references an unknown parent block, the missing parent height is recorded and requested from peers.
+
+Similarly, if a block references transactions that are not present locally, the node requests the missing transaction data.
+
+Missing blocks and transactions are retried using bounded exponential backoff. This allows the network to recover from out-of-order delivery or dropped messages while avoiding excessive request traffic.
+
+## Testing
+
+The implementation includes:
+
+- Unit tests for block and transaction primitives
+- Payload serialization tests
+- Multi-node synchronization tests
+- Chain adoption tests
+- Fork recovery tests
+
+The tests verify that lagging miners correctly synchronize with peers and eventually converge on the same active chain.
