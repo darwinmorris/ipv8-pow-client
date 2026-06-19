@@ -22,7 +22,6 @@ from lab3.blocks import (
     Block,
     Transaction,
     Blockchain,
-    genesis_block,
     meets_difficulty,
     pack_header,
     txs_commitment,
@@ -289,7 +288,6 @@ class BlockchainCommunity(Community):
         for target in targets:
             self.ez_send(target, GetBlock(height))
 
-    
     def request_transactions(self, tx_hashes: list[bytes], peer: Peer | None = None) -> None:
         targets = [peer] if peer is not None and self.is_member(peer) else self.member_peers()
 

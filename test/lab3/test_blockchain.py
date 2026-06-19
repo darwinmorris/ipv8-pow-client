@@ -14,6 +14,8 @@ from ipv8.test.mocking.endpoint import AutoMockEndpoint
 
 from lab3.blocks import genesis_block, make_block, meets_difficulty
 from lab3.community import BlockchainCommunity, BlockchainSettings
+from hashlib import sha256
+from lab3.payloads import GetBlock, GetTransaction
 
 BlockchainCommunity.community_id = b"\xab" * 20
 
@@ -179,6 +181,84 @@ def test_lagging_miner_adopts_when_tip_arrives_first():
 
     assert len(follower.blockchain.chain) == len(leader_chain)
     assert follower.blockchain.chain[-1].block_hash == leader_chain[-1].block_hash
+
+
+def test_remember_missing_block_requests_once():
+    _keys, _private_keys, (community, peer_owner, _other) = make_miners()
+    peer = peer_for(peer_owner)
+
+    sent = []
+    community.ez_send = lambda peer, payload: sent.append((peer, payload))  # type: ignore[method-assign]
+
+    community.remember_missing_block(3, peer)
+    community.remember_missing_block(3, peer)
+
+    assert community.missing_block_requests[3][1] == 1
+    assert len(sent) == 1
+    assert isinstance(sent[0][1], GetBlock)
+    assert sent[0][1].height == 3
+
+
+def test_remember_missing_transactions_requests_only_new_hashes():
+    _keys, _private_keys, (community, peer_owner, _other) = make_miners()
+    peer = peer_for(peer_owner)
+    tx_hash = sha256(b"missing tx").digest()
+
+    sent = []
+    community.ez_send = lambda peer, payload: sent.append((peer, payload))  # type: ignore[method-assign]
+
+    community.remember_missing_transactions([tx_hash], peer)
+    community.remember_missing_transactions([tx_hash], peer)
+
+    assert community.missing_tx_requests[tx_hash][1] == 1
+    assert len(sent) == 1
+    assert isinstance(sent[0][1], GetTransaction)
+    assert sent[0][1].tx_hash == tx_hash
+
+
+def test_retry_missing_block_uses_backoff_and_increments_retry_count():
+    _keys, _private_keys, (community, _peer, _other) = make_miners()
+
+    requested = []
+    community.request_block = lambda height, peer=None: requested.append((height, peer))  # type: ignore[method-assign]
+
+    community.missing_block_requests[4] = (0.0, 1)
+
+    with patch("lab3.community.time.time", return_value=10.0):
+        community.retry_missing_blocks()
+
+    assert community.missing_block_requests[4][1] == 2
+    assert requested == [(4, None)]
+
+
+def test_retry_missing_transaction_uses_backoff_and_increments_retry_count():
+    _keys, _private_keys, (community, _peer, _other) = make_miners()
+    tx_hash = sha256(b"missing tx").digest()
+
+    requested = []
+    community.request_transactions = lambda tx_hashes, peer=None: requested.append((tx_hashes, peer))  # type: ignore[method-assign]
+
+    community.missing_tx_requests[tx_hash] = (0.0, 1)
+
+    with patch("lab3.community.time.time", return_value=10.0):
+        community.retry_missing_transactions()
+
+    assert community.missing_tx_requests[tx_hash][1] == 2
+    assert requested == [([tx_hash], None)]
+
+
+def test_retry_missing_transaction_removed_when_arrived():
+    _keys, _private_keys, (community, _peer, _other) = make_miners()
+
+    tx_hash = sha256(b"tx").digest()
+
+    community.missing_tx_requests[tx_hash] = (0.0, 1)
+
+    community.blockchain.chain_tx_hashes.add(tx_hash)
+
+    community.retry_missing_transactions()
+
+    assert tx_hash not in community.missing_tx_requests
 
 
 if __name__ == "__main__":
