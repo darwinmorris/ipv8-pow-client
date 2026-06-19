@@ -153,10 +153,7 @@ class Blockchain:
             if not tx.verify():
                 return False, []
 
-        if missing_txs:
-            return False, missing_txs
-
-        return True, []
+        return True, missing_txs
 
 
     def add_block(self, block: Block) -> tuple[bool, int | None, list[bytes]]:
@@ -183,6 +180,11 @@ class Blockchain:
         missing_height = None
         for block in sorted(self.block_pool.values(), key=lambda b: (-b.height, b.block_hash)):
             if block.height <= self.height and self.chain[block.height].block_hash == block.block_hash:
+                continue
+            
+            txs_valid, missing_txs = self.validate_block_transactions(block)
+
+            if not txs_valid or missing_txs:
                 continue
 
             branch, fork_point, missing = self.trace_branch(block)

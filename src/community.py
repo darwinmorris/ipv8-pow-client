@@ -96,6 +96,11 @@ class BlockchainCommunity(Community):
         tx = Transaction(payload.sender_key, payload.data, payload.timestamp, payload.signature)
         if tx.verify():
             if self.blockchain.accept_transaction(tx):
+                # did this transaction change adoption status
+                missing = self.blockchain.try_adopt()
+                if missing is not None:
+                    self.remember_missing_block(missing, peer)
+
                 self.gossip_to_members(
                     TransactionGossip(tx.sender_key, tx.data, tx.timestamp, tx.signature)
                 )
@@ -137,6 +142,10 @@ class BlockchainCommunity(Community):
             return
 
         if self.blockchain.accept_transaction(tx):
+            missing = self.blockchain.try_adopt()
+            if missing is not None:
+                self.remember_missing_block(missing, peer)
+
             self.gossip_to_members(
                 TransactionGossip(tx.sender_key, tx.data, tx.timestamp, tx.signature),
                 exclude=peer,
@@ -179,7 +188,7 @@ class BlockchainCommunity(Community):
         tx = self.blockchain.mempool.get(payload.tx_hash)
         if tx is None:
             return
-
+        
         self.ez_send(
             peer,
             TransactionGossip(tx.sender_key, tx.data, tx.timestamp, tx.signature),

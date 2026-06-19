@@ -115,7 +115,7 @@ def test_block_reports_missing_transaction():
 
     valid, missing = bc.validate_block_transactions(block)
 
-    assert not valid
+    assert valid
     assert missing == [missing_tx_hash]
 
 
