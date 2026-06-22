@@ -18,7 +18,6 @@ from ipv8.lazy_community import lazy_wrapper
 from ipv8.peer import Peer
 
 from src.blocks import (
-    HASH_SIZE,
     MAX_REORG_DEPTH,
     NONCE_MASK,
     Block,
@@ -27,12 +26,16 @@ from src.blocks import (
     meets_difficulty,
     median_time_past,
     pack_header,
+    pack_transactions,
     txs_commitment,
+    unpack_transactions,
 )
 from src.payloads import (
+    BlockFullResponse,
     BlockResponse,
     ChainHeightResponse,
     GetBlock,
+    GetBlockFull,
     GetChainHeight,
     NewBlockGossip,
     SubmitTransaction,
@@ -86,6 +89,8 @@ class BlockchainCommunity(Community):
         self.add_message_handler(NewBlockGossip, self.on_new_block)
         self.add_message_handler(TransactionGossip, self.on_transaction_gossip)
         self.add_message_handler(GetTransaction, self.on_get_transaction)
+        self.add_message_handler(GetBlockFull, self.on_get_block_full)
+        self.add_message_handler(BlockFullResponse, self.on_block_full_response)
 
         self.register_task("mine", self.mine_forever)
         self.register_task("sync", self.sync_with_teammates, interval=SYNC_INTERVAL)
@@ -222,14 +227,31 @@ class BlockchainCommunity(Community):
         if self.is_member(peer):
             self.handle_block(peer, payload.height, payload.prev_hash, payload.txs_hash,
                               payload.timestamp, payload.difficulty, payload.nonce,
-                              payload.tx_hashes)
+                              payload.tx_bodies)
 
     @lazy_wrapper(BlockResponse)
     def on_block_response(self, peer: Peer, payload: BlockResponse) -> None:
         if self.is_member(peer):
-            self.handle_block(peer, payload.height, payload.prev_hash, payload.txs_hash,
-                              payload.timestamp, payload.difficulty, payload.nonce,
-                              payload.tx_hashes)
+            self.request_block(payload.height, peer)
+
+    @lazy_wrapper(GetBlockFull)
+    def on_get_block_full(self, peer: Peer, payload: GetBlockFull) -> None:
+        if not self.is_member(peer) or not 0 <= payload.height < len(self.blockchain.chain):
+            return
+        block = self.blockchain.chain[payload.height]
+        self.ez_send(peer, BlockFullResponse(
+            block.height, block.prev_hash, block.txs_hash,
+            block.timestamp, block.difficulty, block.nonce,
+            block.block_hash, pack_transactions(block.transactions),
+        ))
+
+    @lazy_wrapper(BlockFullResponse)
+    def on_block_full_response(self, peer: Peer, payload: BlockFullResponse) -> None:
+        if not self.is_member(peer):
+            return
+        self.handle_block(peer, payload.height, payload.prev_hash, payload.txs_hash,
+                          payload.timestamp, payload.difficulty, payload.nonce,
+                          payload.tx_bodies)
 
     def sync_with_teammates(self) -> None:
         for member in self.member_peers():
@@ -265,7 +287,7 @@ class BlockchainCommunity(Community):
         if not self.is_member(peer):
             return
 
-        tx = self.blockchain.mempool.get(payload.tx_hash)
+        tx = self.blockchain.find_transaction(payload.tx_hash)
         if tx is None:
             return
         
@@ -279,6 +301,10 @@ class BlockchainCommunity(Community):
 
         for tx_hash, (last_requested, retries) in list(self.missing_tx_requests.items()):
             if tx_hash in self.blockchain.mempool or tx_hash in self.blockchain.chain_tx_hashes:
+                del self.missing_tx_requests[tx_hash]
+                continue
+
+            if self.blockchain.find_transaction(tx_hash) is not None:
                 del self.missing_tx_requests[tx_hash]
                 continue
 
@@ -323,13 +349,20 @@ class BlockchainCommunity(Community):
     # --- chain state ----------------------------------------------------------
 
     def handle_block(self, peer: Peer, height: int, prev_hash: bytes, txs_hash: bytes,
-                     timestamp: int, difficulty: int, nonce: int, tx_hashes_blob: bytes) -> None:
-        if height < 1 or len(tx_hashes_blob) % HASH_SIZE != 0:
+                     timestamp: int, difficulty: int, nonce: int,
+                     tx_bodies: bytes = b"") -> None:
+        if height < 1:
             return
-        tx_hashes = [tx_hashes_blob[i:i + HASH_SIZE] for i in range(0, len(tx_hashes_blob), HASH_SIZE)]
+        transactions = unpack_transactions(tx_bodies) if tx_bodies else []
+        tx_hashes = [tx.tx_hash for tx in transactions]
         # Recompute the hash from the header; never trust a received block_hash.
         block_hash = sha256(pack_header(prev_hash, txs_hash, timestamp, difficulty, nonce)).digest()
-        block = Block(height, prev_hash, txs_hash, timestamp, difficulty, nonce, block_hash, tx_hashes)
+        if transactions:
+            block = Block(height, prev_hash, txs_hash, timestamp, difficulty, nonce, block_hash,
+                          transactions)
+        else:
+            block = Block(height, prev_hash, txs_hash, timestamp, difficulty, nonce, block_hash,
+                          pending_tx_hashes=tx_hashes)
 
         accepted, missing, missing_txs = self.blockchain.add_block(block)
 
@@ -388,7 +421,7 @@ class BlockchainCommunity(Community):
     def request_block(self, height: int, peer: Peer | None = None) -> None:
         targets = [peer] if peer is not None and self.is_member(peer) else self.member_peers()
         for target in targets:
-            self.ez_send(target, GetBlock(height))
+            self.ez_send(target, GetBlockFull(height))
 
     def request_transactions(self, tx_hashes: list[bytes], peer: Peer | None = None) -> None:
         targets = [peer] if peer is not None and self.is_member(peer) else self.member_peers()
@@ -415,7 +448,8 @@ class BlockchainCommunity(Community):
         """Mine on the current tip; bail out when the tip or the mempool changes."""
         tip = self.blockchain.chain[-1]
         height = len(self.blockchain.chain)
-        pending = self.blockchain.pending_tx_hashes()
+        pending_txs = list(self.blockchain.mempool.values())
+        pending = [tx.tx_hash for tx in pending_txs]
         txs_hash = txs_commitment(pending)
         # Bonus 5: difficulty is not fixed — it is whatever the retarget mandates
         # for this position, so the whole group mines at the same adaptive target.
@@ -431,12 +465,13 @@ class BlockchainCommunity(Community):
                 digest = sha256(prefix + nonce.to_bytes(8, "big")).digest()
                 if meets_difficulty(digest, difficulty):
                     block = Block(height, tip.block_hash, txs_hash, timestamp,
-                                  difficulty, nonce, digest, pending)
+                                  difficulty, nonce, digest, pending_txs)
                     self.adopt_own_block(block)
                     return
                 nonce = (nonce + 1) & NONCE_MASK
             await asyncio.sleep(0)
-            if self.blockchain.chain[-1] is not tip or self.blockchain.pending_tx_hashes() != pending:
+            new_pending_txs = list(self.blockchain.mempool.values())
+            if self.blockchain.chain[-1] is not tip or [tx.tx_hash for tx in new_pending_txs] != pending:
                 return  # restart on the new tip / with the new transactions
 
     def adopt_own_block(self, block: Block) -> None:
@@ -464,7 +499,7 @@ class BlockchainCommunity(Community):
             block.timestamp,
             block.difficulty,
             block.nonce,
-            b"".join(block.tx_hashes),
+            pack_transactions(block.transactions),
         )
 
         self.gossip_to_members(gossip)

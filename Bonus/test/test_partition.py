@@ -34,6 +34,7 @@ from src.blocks import (
     genesis_block,
     make_block,
     meets_difficulty,
+    pack_transactions,
 )
 from src.community import BlockchainCommunity, BlockchainSettings
 
@@ -142,7 +143,8 @@ def serve_blocks_from(leader: BlockchainCommunity, follower: BlockchainCommunity
         block = leader.blockchain.chain[height]
         follower.handle_block(
             leader_peer, block.height, block.prev_hash, block.txs_hash,
-            block.timestamp, block.difficulty, block.nonce, b"".join(block.tx_hashes),
+            block.timestamp, block.difficulty, block.nonce,
+            pack_transactions(block.transactions),
         )
 
     follower.request_block = answer  # type: ignore[method-assign]
@@ -186,6 +188,7 @@ def test_no_transaction_lost_across_reorg():
     c_block = mine_block(1, genesis[0].block_hash, [tx.tx_hash], 1_718_020_001)
     c.add_block(c_block)
     assert tx.tx_hash in c.chain_tx_hashes
+    assert tx.tx_hash not in c.mempool
     assert tx.tx_hash not in c.pending_tx_hashes()
 
     # A heavier branch without the tx arrives and wins.

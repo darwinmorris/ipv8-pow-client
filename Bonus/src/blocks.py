@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha256
 
 from ipv8.keyvault.crypto import default_eccrypto
@@ -166,6 +166,47 @@ def txs_commitment(tx_hashes: list[bytes]) -> bytes:
     return sha256(b"".join(tx_hashes)).digest()
 
 
+def serialize_transaction(tx: Transaction) -> bytes:
+    """Length-prefixed wire encoding for one transaction body."""
+    return (
+        len(tx.sender_key).to_bytes(2, "big") + tx.sender_key
+        + len(tx.data).to_bytes(4, "big") + tx.data
+        + tx.timestamp.to_bytes(8, "big")
+        + len(tx.signature).to_bytes(2, "big") + tx.signature
+    )
+
+
+def deserialize_transaction(data: bytes, offset: int = 0) -> tuple[Transaction, int]:
+    key_len = int.from_bytes(data[offset:offset + 2], "big")
+    offset += 2
+    sender_key = data[offset:offset + key_len]
+    offset += key_len
+    data_len = int.from_bytes(data[offset:offset + 4], "big")
+    offset += 4
+    payload = data[offset:offset + data_len]
+    offset += data_len
+    timestamp = int.from_bytes(data[offset:offset + 8], "big")
+    offset += 8
+    sig_len = int.from_bytes(data[offset:offset + 2], "big")
+    offset += 2
+    signature = data[offset:offset + sig_len]
+    offset += sig_len
+    return Transaction(sender_key, payload, timestamp, signature), offset
+
+
+def pack_transactions(transactions: list[Transaction]) -> bytes:
+    return b"".join(serialize_transaction(tx) for tx in transactions)
+
+
+def unpack_transactions(data: bytes) -> list[Transaction]:
+    txs: list[Transaction] = []
+    offset = 0
+    while offset < len(data):
+        tx, offset = deserialize_transaction(data, offset)
+        txs.append(tx)
+    return txs
+
+
 @dataclass
 class Transaction:
     sender_key: bytes
@@ -197,8 +238,20 @@ class Block:
     difficulty: int
     nonce: int
     block_hash: bytes
-    tx_hashes: list[bytes]
-    
+    transactions: list[Transaction] = field(default_factory=list)
+    pending_tx_hashes: list[bytes] = field(default_factory=list)
+
+    @property
+    def tx_hashes(self) -> list[bytes]:
+        if self.transactions:
+            return [tx.tx_hash for tx in self.transactions]
+        return self.pending_tx_hashes
+
+    def transaction_by_hash(self, tx_hash: bytes) -> Transaction | None:
+        for tx in self.transactions:
+            if tx.tx_hash == tx_hash:
+                return tx
+        return None
 
     def is_internally_valid(self) -> bool:
         """PoW holds, block_hash matches the header, and the body commitment matches."""
@@ -209,6 +262,11 @@ class Block:
         # against a "longer but fake" branch built from cheap, low-work blocks.
         if self.height > 0 and self.difficulty < MIN_DIFFICULTY:
             return False
+        if self.transactions:
+            if len(self.transactions) != len(self.tx_hashes):
+                return False
+            if [tx.tx_hash for tx in self.transactions] != self.tx_hashes:
+                return False
         header = pack_header(self.prev_hash, self.txs_hash, self.timestamp, self.difficulty, self.nonce)
         return (
             sha256(header).digest() == self.block_hash
@@ -218,11 +276,18 @@ class Block:
 
 
 def make_block(height: int, prev_hash: bytes, tx_hashes: list[bytes],
-               timestamp: int, difficulty: int, nonce: int) -> Block:
+               timestamp: int, difficulty: int, nonce: int,
+               transactions: list[Transaction] | None = None) -> Block:
+    txs = list(transactions) if transactions else []
+    if txs:
+        tx_hashes = [tx.tx_hash for tx in txs]
     txs_hash = txs_commitment(tx_hashes)
     header = pack_header(prev_hash, txs_hash, timestamp, difficulty, nonce)
-    return Block(height, prev_hash, txs_hash, timestamp, difficulty, nonce,
-                 sha256(header).digest(), tx_hashes)
+    block_hash = sha256(header).digest()
+    if txs:
+        return Block(height, prev_hash, txs_hash, timestamp, difficulty, nonce, block_hash, txs)
+    return Block(height, prev_hash, txs_hash, timestamp, difficulty, nonce, block_hash,
+                 pending_tx_hashes=list(tx_hashes))
 
 
 def genesis_block() -> Block:
@@ -292,7 +357,40 @@ class Blockchain:
         return True
 
     def pending_tx_hashes(self) -> list[bytes]:
-        return [txh for txh in self.mempool if txh not in self.chain_tx_hashes]
+        return list(self.mempool.keys())
+
+    def find_transaction(self, tx_hash: bytes) -> Transaction | None:
+        """Look up a transaction in the mempool, active chain, or block pool."""
+        tx = self.mempool.get(tx_hash)
+        if tx is not None:
+            return tx
+        for block in self.chain:
+            tx = block.transaction_by_hash(tx_hash)
+            if tx is not None:
+                return tx
+        for block in self.block_pool.values():
+            tx = block.transaction_by_hash(tx_hash)
+            if tx is not None:
+                return tx
+        return None
+
+    def complete_block_transactions(self, block: Block) -> Block:
+        """Attach full transaction bodies to a block when every hash is known."""
+        if block.transactions and len(block.transactions) == len(block.tx_hashes):
+            if all(tx.tx_hash == h for tx, h in zip(block.transactions, block.tx_hashes)):
+                return block
+
+        txs: list[Transaction] = []
+        for tx_hash in block.tx_hashes:
+            tx = block.transaction_by_hash(tx_hash) or self.find_transaction(tx_hash)
+            if tx is None:
+                return block
+            txs.append(tx)
+
+        return Block(
+            block.height, block.prev_hash, block.txs_hash, block.timestamp,
+            block.difficulty, block.nonce, block.block_hash, txs,
+        )
 
     def validate_block_transactions(self, block: Block) -> tuple[bool, list[bytes]]:
         # Only the position-independent checks live here: no duplicate hashes
@@ -307,7 +405,7 @@ class Blockchain:
         missing_txs = []
 
         for tx_hash in block.tx_hashes:
-            tx = self.mempool.get(tx_hash)
+            tx = block.transaction_by_hash(tx_hash) or self.find_transaction(tx_hash)
 
             if tx is None:
                 missing_txs.append(tx_hash)
@@ -326,6 +424,7 @@ class Blockchain:
         if not block.is_internally_valid():
             return False, None, []
 
+        block = self.complete_block_transactions(block)
         txs_valid, missing_txs = self.validate_block_transactions(block)
 
         if not txs_valid:
@@ -480,15 +579,17 @@ class Blockchain:
         self.chain = new_chain
         self.chain_tx_hashes = new_tx_hashes
 
+        for txh in new_tx_hashes:
+            self.mempool.pop(txh, None)
+
         orphaned = []
         for stale_block in old_blocks_above_fork:
             for txh in stale_block.tx_hashes:
                 if txh in new_tx_hashes:
                     continue  # the branch already re-included it
-                tx = self.mempool.get(txh)
+                tx = stale_block.transaction_by_hash(txh)
                 if tx is not None:
-                    # Still in the mempool (we never evict): it is automatically
-                    # pending again now that it left the chain. Record it.
+                    self.mempool[txh] = tx
                     orphaned.append(txh)
 
         if old_blocks_above_fork:  # a genuine rollback, not a plain extension

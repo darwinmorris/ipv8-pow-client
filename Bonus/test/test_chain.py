@@ -94,7 +94,7 @@ def test_mine_and_validate_block():
         block.difficulty,
         block.nonce + 1,
         block.block_hash,
-        block.tx_hashes,
+        pending_tx_hashes=block.tx_hashes,
     )
     assert not tampered.is_internally_valid()
 
@@ -143,6 +143,27 @@ def test_block_validates_known_transaction():
 
     assert valid
     assert missing == []
+
+
+def test_committed_transactions_stored_in_block():
+    bc = Blockchain()
+    tx = make_signed_tx()
+    bc.accept_transaction(tx)
+    difficulty = 8
+    nonce = 0
+    while True:
+        block = make_block(1, bc.tip.block_hash, [tx.tx_hash], 1718000001, difficulty, nonce,
+                           transactions=[tx])
+        if meets_difficulty(block.block_hash, difficulty):
+            break
+        nonce += 1
+
+    accepted, _, _ = bc.add_block(block)
+
+    assert accepted
+    assert bc.chain[1].transactions == [tx]
+    assert bc.chain[1].transaction_by_hash(tx.tx_hash) == tx
+    assert tx.tx_hash not in bc.mempool
 
 
 def test_payload_roundtrip():

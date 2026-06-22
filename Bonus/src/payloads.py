@@ -75,7 +75,7 @@ class NewBlockGossip(DataClassPayload[7]):
     timestamp: int
     difficulty: int
     nonce: int
-    tx_hashes: bytes
+    tx_bodies: bytes
 
 
 @dataclass
@@ -90,11 +90,27 @@ class TransactionGossip(DataClassPayload[8]):
 class GetTransaction(DataClassPayload[9]):
     tx_hash: bytes
 
+@dataclass
+class GetBlockFull(DataClassPayload[10]):
+    height: int
+
+
+@dataclass
+class BlockFullResponse(DataClassPayload[11]):
+    height: int
+    prev_hash: bytes
+    txs_hash: bytes
+    timestamp: int
+    difficulty: int
+    nonce: int
+    block_hash: bytes
+    tx_bodies: bytes  # serialized transaction bodies (see blocks.pack_transactions)
+
 
 # DataClassPayload registers its wire format on first instantiation, which must
 # happen before the first inbound packet of that type is unpacked.
 for _cls in (RegisterBlockchain, RegisterResponse, SubmitTransaction,
              SubmitTransactionResponse, GetChainHeight, ChainHeightResponse,
              GetBlock, BlockResponse, NewBlockGossip, TransactionGossip,
-             GetTransaction):
+             GetTransaction, GetBlockFull, BlockFullResponse):
     _cls(*([None] * len(_cls.__dataclass_fields__)))

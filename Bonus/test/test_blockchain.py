@@ -13,10 +13,17 @@ from ipv8.peerdiscovery.network import Network
 from ipv8.test.mocking.endpoint import AutoMockEndpoint
 
 import src.blocks as blocks
-from src.blocks import Blockchain, Transaction, genesis_block, make_block, meets_difficulty
+from src.blocks import (
+    Blockchain,
+    Transaction,
+    genesis_block,
+    make_block,
+    meets_difficulty,
+    pack_transactions,
+)
 from src.community import BlockchainCommunity, BlockchainSettings
 from hashlib import sha256
-from src.payloads import GetBlock, GetTransaction
+from src.payloads import GetBlockFull, GetTransaction
 
 BlockchainCommunity.community_id = b"\xab" * 20
 
@@ -114,7 +121,7 @@ def gossip_block(community: BlockchainCommunity, peer: Peer, block) -> None:
         block.timestamp,
         block.difficulty,
         block.nonce,
-        b"".join(block.tx_hashes),
+        pack_transactions(block.transactions),
     )
 
 
@@ -201,7 +208,7 @@ def test_remember_missing_block_requests_once():
 
     assert community.missing_block_requests[3][1] == 1
     assert len(sent) == 1
-    assert isinstance(sent[0][1], GetBlock)
+    assert isinstance(sent[0][1], GetBlockFull)
     assert sent[0][1].height == 3
 
 
