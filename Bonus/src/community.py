@@ -13,6 +13,7 @@ import random
 import time
 from hashlib import sha256
 
+from collections import defaultdict
 from ipv8.community import Community, CommunitySettings
 from ipv8.lazy_community import lazy_wrapper
 from ipv8.peer import Peer
@@ -47,6 +48,7 @@ MAX_RETRIES = 5
 NONCE_BATCH = 20_000      # hashes per event-loop yield while mining
 SYNC_INTERVAL = 5.0       # seconds between tip polls to teammates
 PARTITION_RELOAD_INTERVAL = 1.0  # how often we re-read the partition control file
+FORCE_PROVIDE_ALL = os.environ.get("COMPACT_PROVIDE_ALL") == "1"
 
 
 class BlockchainSettings(CommunitySettings):
@@ -67,6 +69,8 @@ class BlockchainCommunity(Community):
         # item -> (last_requested_time, retry_count)
         self.missing_block_requests: dict[int, tuple[float, int]] = {}
         self.missing_tx_requests: dict[bytes, tuple[float, int]] = {}
+
+        self.peer_known_txs: dict[Peer, set[bytes]] = defaultdict(set)
 
         # --- Bonus 4: partition simulation ---------------------------------
         # Teammate keys we are currently cut off from. A peer in this set is
@@ -167,9 +171,7 @@ class BlockchainCommunity(Community):
                 if missing is not None:
                     self.remember_missing_block(missing, peer)
 
-                self.gossip_to_members(
-                    TransactionGossip(tx.sender_key, tx.data, tx.timestamp, tx.signature)
-                )
+                self.gossip_transaction_to_members(tx)
             self.ez_send(peer, SubmitTransactionResponse(True, tx.tx_hash, "accepted"))
             print(f"[tx] accepted {tx.tx_hash.hex()[:16]} from server")
         else:
@@ -207,22 +209,42 @@ class BlockchainCommunity(Community):
         if not tx.verify():
             return
 
+        self.peer_known_txs[peer].add(tx.tx_hash)
+        
         if self.blockchain.accept_transaction(tx):
             missing = self.blockchain.try_adopt()
             if missing is not None:
                 self.remember_missing_block(missing, peer)
 
-            self.gossip_to_members(
-                TransactionGossip(tx.sender_key, tx.data, tx.timestamp, tx.signature),
-                exclude=peer,
-            )
+            self.gossip_transaction_to_members(tx, exclude=peer)
 
     @lazy_wrapper(NewBlockGossip)
     def on_new_block(self, peer: Peer, payload: NewBlockGossip) -> None:
-        if self.is_member(peer):
-            self.handle_block(peer, payload.height, payload.prev_hash, payload.txs_hash,
-                              payload.timestamp, payload.difficulty, payload.nonce,
-                              payload.tx_hashes)
+        if not self.is_member(peer):
+            return
+
+        for tx_payload in payload.provided_txs:
+            tx = Transaction(
+                tx_payload.sender_key,
+                tx_payload.data,
+                tx_payload.timestamp,
+                tx_payload.signature,
+            )
+
+            if tx.verify():
+                self.blockchain.accept_transaction(tx)
+                self.peer_known_txs[peer].add(tx.tx_hash)
+
+        self.handle_block(
+            peer,
+            payload.height,
+            payload.prev_hash,
+            payload.txs_hash,
+            payload.timestamp,
+            payload.difficulty,
+            payload.nonce,
+            payload.tx_hashes,
+        )
 
     @lazy_wrapper(BlockResponse)
     def on_block_response(self, peer: Peer, payload: BlockResponse) -> None:
@@ -273,6 +295,8 @@ class BlockchainCommunity(Community):
             peer,
             TransactionGossip(tx.sender_key, tx.data, tx.timestamp, tx.signature),
         )
+        # we are assuming received and processed
+        self.peer_known_txs[peer].add(tx.tx_hash)
 
     def retry_missing_transactions(self) -> None:
         now = time.time()
@@ -402,6 +426,62 @@ class BlockchainCommunity(Community):
             if exclude is not None and member == exclude:
                 continue
             self.ez_send(member, payload)
+    
+    def gossip_transaction_to_members(self, tx: Transaction, exclude: Peer | None = None) -> None:
+        payload = TransactionGossip(tx.sender_key, tx.data, tx.timestamp, tx.signature)
+
+        for member in self.member_peers():
+            if exclude is not None and member == exclude:
+                continue
+
+            self.ez_send(member, payload)
+
+            # We just sent this tx to that peer, so we assume they know it now.
+            self.peer_known_txs[member].add(tx.tx_hash)
+    
+    def gossip_compact_block_to_members(self, block: Block) -> None:
+        for peer in self.member_peers():
+            known = self.peer_known_txs.get(peer, set())
+
+            provided_txs = []
+            for tx_hash in block.tx_hashes:
+                if not FORCE_PROVIDE_ALL and tx_hash in known:
+                    continue
+
+                tx = self.blockchain.mempool.get(tx_hash)
+                if tx is None:
+                    continue
+
+                provided_txs.append(
+                    TransactionGossip(
+                        tx.sender_key,
+                        tx.data,
+                        tx.timestamp,
+                        tx.signature,
+                    )
+                )
+
+            gossip = NewBlockGossip(
+                block.height,
+                block.prev_hash,
+                block.txs_hash,
+                block.timestamp,
+                block.difficulty,
+                block.nonce,
+                b"".join(block.tx_hashes),
+                provided_txs,
+            )
+            
+            print(
+                f"[compact-send] peer={peer.public_key.key_to_bin().hex()[:8]} "
+                f"hashes={len(block.tx_hashes)} "
+                f"provided={len(provided_txs)}"
+            )
+
+            self.ez_send(peer, gossip)
+
+            # After sending, we believe peer can reconstruct/know these txs.
+            self.peer_known_txs[peer].update(block.tx_hashes)
             
 
     # --- mining ---------------------------------------------------------------
@@ -457,14 +537,4 @@ class BlockchainCommunity(Community):
         print(f"[mine] found block {block.height} {block.block_hash.hex()[:16]} "
             f"({len(block.tx_hashes)} txs)")
 
-        gossip = NewBlockGossip(
-            block.height,
-            block.prev_hash,
-            block.txs_hash,
-            block.timestamp,
-            block.difficulty,
-            block.nonce,
-            b"".join(block.tx_hashes),
-        )
-
-        self.gossip_to_members(gossip)
+        self.gossip_compact_block_to_members(block)
