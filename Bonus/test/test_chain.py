@@ -32,6 +32,15 @@ def make_signed_tx(data: bytes = b"hello lab3", timestamp: int = 1718000000) -> 
     return Transaction(sender_key, data, timestamp, signature)
 
 
+def mine_block(height, prev_hash, transactions, timestamp, difficulty=8):
+    nonce = 0
+    while True:
+        block = make_block(height, prev_hash, transactions, timestamp, difficulty, nonce)
+        if meets_difficulty(block.block_hash, difficulty):
+            return block
+        nonce += 1
+
+
 def test_header_packing():
     header = pack_header(b"\x01" * 32, b"\x02" * 32, 1718000000, 22, 12345)
     assert len(header) == 84
@@ -78,13 +87,13 @@ def test_mine_and_validate_block():
     nonce = 0
 
     while True:
-        block = make_block(1, genesis.block_hash, tx_hashes, 1718000000, difficulty, nonce)
+        block = make_block(1, genesis.block_hash, [], 1718000000, difficulty, nonce)
         if meets_difficulty(block.block_hash, difficulty):
             break
         nonce += 1
 
     assert block.is_internally_valid()
-    assert block.txs_hash == sha256(tx_hashes[0] + tx_hashes[1]).digest()
+    assert block.txs_hash == sha256(b"").digest()
 
     tampered = Block(
         block.height,
@@ -95,6 +104,7 @@ def test_mine_and_validate_block():
         block.nonce + 1,
         block.block_hash,
         block.tx_hashes,
+        block.transactions,
     )
     assert not tampered.is_internally_valid()
 
@@ -108,10 +118,36 @@ def test_blockchain_accept_transaction_once():
     assert tx.tx_hash in bc.mempool
 
 
+def test_accept_transaction_attaches_to_waiting_blocks_when_already_pending():
+    """A tx already in the mempool must still fill bodies on waiting pool blocks."""
+    bc = Blockchain()
+    tx = make_signed_tx(b"waiting in mempool")
+    genesis = bc.tip
+
+    b1_full = mine_block(1, genesis.block_hash, [tx], 1_718_000_001)
+    b1 = Block(
+        b1_full.height, b1_full.prev_hash, b1_full.txs_hash, b1_full.timestamp,
+        b1_full.difficulty, b1_full.nonce, b1_full.block_hash, b1_full.tx_hashes, [],
+    )
+
+    bc.accept_transaction(tx)
+    bc.add_block(b1)
+    assert b1.transactions == []
+
+    assert not bc.accept_transaction(tx)
+    assert b1.transactions == [tx]
+
+    bc.try_adopt()
+    assert bc.height == 1
+
+
 def test_block_reports_missing_transaction():
     bc = Blockchain()
     missing_tx_hash = sha256(b"missing").digest()
-    block = make_block(1, bc.tip.block_hash, [missing_tx_hash], 1718000001, 1, 0)
+    block = Block(
+        1, bc.tip.block_hash, txs_commitment([missing_tx_hash]), 1718000001, 1, 0,
+        b"\x00" * 32, [missing_tx_hash], [],
+    )
 
     valid, missing = bc.validate_block_transactions(block)
 
@@ -124,7 +160,7 @@ def test_block_rejects_duplicate_tx_hashes():
     tx = make_signed_tx()
     bc.accept_transaction(tx)
 
-    block = make_block(1, bc.tip.block_hash, [tx.tx_hash, tx.tx_hash], 1718000001, 1, 0)
+    block = make_block(1, bc.tip.block_hash, [tx, tx], 1718000001, 1, 0)
 
     valid, missing = bc.validate_block_transactions(block)
 
@@ -135,13 +171,26 @@ def test_block_rejects_duplicate_tx_hashes():
 def test_block_validates_known_transaction():
     bc = Blockchain()
     tx = make_signed_tx()
-    bc.accept_transaction(tx)
 
-    block = make_block(1, bc.tip.block_hash, [tx.tx_hash], 1718000001, 1, 0)
+    block = make_block(1, bc.tip.block_hash, [tx], 1718000001, 1, 0)
 
     valid, missing = bc.validate_block_transactions(block)
 
     assert valid
+    assert missing == []
+
+
+def test_block_rejects_uncommitted_transaction_body():
+    bc = Blockchain()
+    committed = make_signed_tx(b"committed")
+    extra = make_signed_tx(b"not in header")
+
+    block = make_block(1, bc.tip.block_hash, [committed], 1718000001, 1, 0)
+    block.transactions.append(extra)
+
+    valid, missing = bc.validate_block_transactions(block)
+
+    assert not valid
     assert missing == []
 
 
