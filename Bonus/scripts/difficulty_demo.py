@@ -53,7 +53,8 @@ def run(hashrate_at, n_blocks, *, liar_at=None):
             # The liar publishes a wildly future-dated block.
             block = Block(block.height, block.prev_hash, block.txs_hash,
                           block.timestamp + 100_000, block.difficulty,
-                          block.nonce, block.block_hash, block.tx_hashes)
+                          block.nonce, block.block_hash, block.tx_hashes,
+                          block.transactions)
 
         chain.append(block)
         rows.append((height, difficulty, interval, hashrate))

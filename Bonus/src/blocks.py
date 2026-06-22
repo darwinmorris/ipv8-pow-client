@@ -198,6 +198,7 @@ class Block:
     nonce: int
     block_hash: bytes
     tx_hashes: list[bytes]
+    transactions: list[Transaction]
     
 
     def is_internally_valid(self) -> bool:
@@ -217,22 +218,27 @@ class Block:
         )
 
 
-def make_block(height: int, prev_hash: bytes, tx_hashes: list[bytes],
+def make_block(height: int, prev_hash: bytes, transactions: list[Transaction],
                timestamp: int, difficulty: int, nonce: int) -> Block:
+    tx_hashes = [tx.tx_hash for tx in transactions]
     txs_hash = txs_commitment(tx_hashes)
     header = pack_header(prev_hash, txs_hash, timestamp, difficulty, nonce)
     return Block(height, prev_hash, txs_hash, timestamp, difficulty, nonce,
-                 sha256(header).digest(), tx_hashes)
+                 sha256(header).digest(), tx_hashes, list(transactions))
 
 
 def genesis_block() -> Block:
     """Fixed group-wide genesis; every node boots with this exact block 0."""
     return make_block(0, b"\x00" * HASH_SIZE, [], 0, 0, 0)
 
+
 class Blockchain:
     def __init__(self):
         self.chain: list[Block] = [genesis_block()]
         self.block_pool: dict[bytes, Block] = {}
+        # Pending pool: transactions not yet on the active chain. A tx referenced
+        # by an unconfirmed block in the block pool stays here until that branch
+        # wins (or the tx is orphaned back here after a reorg).
         self.mempool: dict[bytes, Transaction] = {}
         self.chain_tx_hashes: set[bytes] = set()
         # Bonus 4 telemetry: how many reorgs we have performed, the depth of the
@@ -242,7 +248,7 @@ class Blockchain:
         self.reorg_count: int = 0
         self.last_reorg_depth: int = 0
         self.last_orphaned_txs: list[bytes] = []
-       
+
 
     @property
     def height(self) -> int:
@@ -282,33 +288,74 @@ class Blockchain:
         return True
 
     def accept_transaction(self, tx: Transaction) -> bool:
+        """Index a tx for lookup and attach it to waiting blocks.
+
+        Returns True only when the tx is newly added to the mempool. A tx that
+        is already pending, or already confirmed on the active chain, is still
+        attached to any block-pool entry that references it.
+        """
         if tx.tx_hash in self.chain_tx_hashes:
+            self._attach_transaction_to_waiting_blocks(tx)
             return False
 
-        if tx.tx_hash in self.mempool:
-            return False
+        is_new = tx.tx_hash not in self.mempool
+        if is_new:
+            self.mempool[tx.tx_hash] = tx
 
-        self.mempool[tx.tx_hash] = tx
-        return True
+        self._attach_transaction_to_waiting_blocks(tx)
+        return is_new
 
     def pending_tx_hashes(self) -> list[bytes]:
         return [txh for txh in self.mempool if txh not in self.chain_tx_hashes]
 
+    def get_transaction(self, tx_hash: bytes) -> Transaction | None:
+        """Look up a transaction from the mempool or the active chain."""
+        tx = self.mempool.get(tx_hash)
+        if tx is not None:
+            return tx
+        for block in self.chain:
+            for candidate in block.transactions:
+                if candidate.tx_hash == tx_hash:
+                    return candidate
+        return None
+
+    def _attach_transaction_to_waiting_blocks(self, tx: Transaction) -> None:
+        """Attach a newly learned tx to blocks in the pool that still need it."""
+        for block in self.block_pool.values():
+            if tx.tx_hash not in block.tx_hashes:
+                continue
+            if any(existing.tx_hash == tx.tx_hash for existing in block.transactions):
+                continue
+            block.transactions.append(tx)
+
+    def _drop_confirmed_from_mempool(self, tx_hashes: list[bytes] | set[bytes]) -> None:
+        """Remove transactions from the pending pool once they are on the active chain."""
+        for tx_hash in tx_hashes:
+            self.mempool.pop(tx_hash, None)
+
     def validate_block_transactions(self, block: Block) -> tuple[bool, list[bytes]]:
-        # Only the position-independent checks live here: no duplicate hashes
-        # inside the block, and every referenced tx is known and validly signed.
-        # We deliberately do NOT reject a tx just because it is already in our
-        # active chain — a competing fork may re-include it because the blocks
-        # holding it are about to be rolled back. That double-spend decision is
-        # context-dependent and is made against the post-fork chain in try_adopt.
+        # Position-independent checks: no duplicate hashes inside the block, every
+        # embedded tx is listed in the header commitment, and every listed hash that
+        # we have a body for is validly signed. We deliberately do NOT reject a tx
+        # just because it is already in our active chain — a competing fork may
+        # re-include it because the blocks holding it are about to be rolled back.
+        # That double-spend decision is context-dependent and is made in try_adopt.
         if len(block.tx_hashes) != len(set(block.tx_hashes)):
             return False, []
 
+        if len(block.transactions) != len({tx.tx_hash for tx in block.transactions}):
+            return False, []
+
+        committed = set(block.tx_hashes)
+        for tx in block.transactions:
+            if tx.tx_hash not in committed:
+                return False, []
+
+        embedded = {tx.tx_hash: tx for tx in block.transactions}
         missing_txs = []
 
         for tx_hash in block.tx_hashes:
-            tx = self.mempool.get(tx_hash)
-
+            tx = embedded.get(tx_hash)
             if tx is None:
                 missing_txs.append(tx_hash)
                 continue
@@ -333,9 +380,12 @@ class Blockchain:
 
         self.block_pool[block.block_hash] = block
 
+        for tx in block.transactions:
+            self.accept_transaction(tx)
+
         if missing_txs:
             return False, None, missing_txs
-        
+
         missing_block = self.try_adopt()
         return True, missing_block, []
 
@@ -482,14 +532,14 @@ class Blockchain:
 
         orphaned = []
         for stale_block in old_blocks_above_fork:
-            for txh in stale_block.tx_hashes:
-                if txh in new_tx_hashes:
+            for tx in stale_block.transactions:
+                if tx.tx_hash in new_tx_hashes:
                     continue  # the branch already re-included it
-                tx = self.mempool.get(txh)
-                if tx is not None:
-                    # Still in the mempool (we never evict): it is automatically
-                    # pending again now that it left the chain. Record it.
-                    orphaned.append(txh)
+                # Restore the tx body from the orphaned block back to pending.
+                self.mempool[tx.tx_hash] = tx
+                orphaned.append(tx.tx_hash)
+
+        self._drop_confirmed_from_mempool(new_tx_hashes)
 
         if old_blocks_above_fork:  # a genuine rollback, not a plain extension
             self.reorg_count += 1

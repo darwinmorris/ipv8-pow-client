@@ -50,10 +50,10 @@ blocks.DIFFICULTY = TEST_DIFFICULTY
 # --- helpers ----------------------------------------------------------------
 
 
-def mine_block(height, prev_hash, tx_hashes, timestamp, difficulty=TEST_DIFFICULTY):
+def mine_block(height, prev_hash, transactions, timestamp, difficulty=TEST_DIFFICULTY):
     nonce = 0
     while True:
-        block = make_block(height, prev_hash, tx_hashes, timestamp, difficulty, nonce)
+        block = make_block(height, prev_hash, transactions, timestamp, difficulty, nonce)
         if meets_difficulty(block.block_hash, difficulty):
             return block
         nonce += 1
@@ -183,7 +183,7 @@ def test_no_transaction_lost_across_reorg():
     c = Blockchain()
     c.accept_transaction(tx)
     # C mines the tx into its (shorter) branch.
-    c_block = mine_block(1, genesis[0].block_hash, [tx.tx_hash], 1_718_020_001)
+    c_block = mine_block(1, genesis[0].block_hash, [tx], 1_718_020_001)
     c.add_block(c_block)
     assert tx.tx_hash in c.chain_tx_hashes
     assert tx.tx_hash not in c.pending_tx_hashes()
