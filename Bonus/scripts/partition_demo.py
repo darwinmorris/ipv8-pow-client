@@ -44,22 +44,22 @@ DIFF = 8  # cheap to mine for a live demo, comfortably above the floor
 blocks.DIFFICULTY = DIFF
 
 
-def mine(height, prev_hash, tx_hashes, ts, difficulty=DIFF):
+def mine(height, prev_hash, transactions, ts, difficulty=DIFF):
     nonce = 0
     while True:
-        block = make_block(height, prev_hash, tx_hashes, ts, difficulty, nonce)
+        block = make_block(height, prev_hash, transactions, ts, difficulty, nonce)
         if meets_difficulty(block.block_hash, difficulty):
             return block
         nonce += 1
 
 
-def mine_run(start_block, count, *, seed, tx_at=None, tx_hash=None, difficulty=DIFF):
-    """Mine `count` blocks on top of start_block. Optionally embed tx_hash in the
+def mine_run(start_block, count, *, seed, tx_at=None, tx=None, difficulty=DIFF):
+    """Mine `count` blocks on top of start_block. Optionally embed `tx` in the
     block at index `tx_at`."""
     out = []
     prev = start_block
     for i in range(count):
-        txs = [tx_hash] if (tx_at is not None and i == tx_at) else []
+        txs = [tx] if (tx_at is not None and i == tx_at and tx is not None) else []
         block = mine(prev.height + 1, prev.block_hash, txs, 1_700_000_000 + seed * 10_000 + i, difficulty)
         out.append(block)
         prev = block
@@ -101,7 +101,7 @@ def main() -> None:
     # 2 + 3. Partition. Each side mines its own run.
     print("\n[2] PARTITION: {A,B}  |  {C}   (the two sides cannot reach each other)")
     big = mine_run(g, 6, seed=1)                       # {A, B}: 6 blocks
-    small = mine_run(g, 3, seed=2, tx_at=1, tx_hash=tx.tx_hash)  # {C}: 3 blocks, tx in block 2
+    small = mine_run(g, 3, seed=2, tx_at=1, tx=tx)  # {C}: 3 blocks, tx in block 2
 
     for blk in big:
         a.add_block(blk)

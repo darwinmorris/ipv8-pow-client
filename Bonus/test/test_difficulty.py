@@ -151,6 +151,7 @@ def test_single_timestamp_liar_does_not_move_difficulty():
         victim.height, victim.prev_hash, victim.txs_hash,
         victim.timestamp + 100_000,  # blatant future lie
         victim.difficulty, victim.nonce, victim.block_hash, victim.tx_hashes,
+        victim.transactions,
     )
 
     assert expected_difficulty(liar_chain) == honest
@@ -168,6 +169,7 @@ def test_liar_cannot_drag_difficulty_across_many_recomputes():
             lied[-1].height, lied[-1].prev_hash, lied[-1].txs_hash,
             lied[-1].timestamp + 50_000, lied[-1].difficulty,
             lied[-1].nonce, lied[-1].block_hash, lied[-1].tx_hashes,
+            lied[-1].transactions,
         )
         assert expected_difficulty(lied) == honest
 

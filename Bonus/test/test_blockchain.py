@@ -13,7 +13,7 @@ from ipv8.peerdiscovery.network import Network
 from ipv8.test.mocking.endpoint import AutoMockEndpoint
 
 import src.blocks as blocks
-from src.blocks import Blockchain, Transaction, genesis_block, make_block, meets_difficulty
+from src.blocks import Blockchain, Block, Transaction, genesis_block, make_block, meets_difficulty
 from src.community import BlockchainCommunity, BlockchainSettings
 from hashlib import sha256
 from src.payloads import GetBlock, GetTransaction
@@ -302,10 +302,10 @@ def signed_tx(data: bytes = b"shared tx") -> Transaction:
     return Transaction(sender_key, data, timestamp, signature)
 
 
-def mine_block(height, prev_hash, tx_hashes, timestamp, difficulty=TEST_DIFFICULTY):
+def mine_block(height, prev_hash, transactions, timestamp, difficulty=TEST_DIFFICULTY):
     nonce = 0
     while True:
-        block = make_block(height, prev_hash, tx_hashes, timestamp, difficulty, nonce)
+        block = make_block(height, prev_hash, transactions, timestamp, difficulty, nonce)
         if meets_difficulty(block.block_hash, difficulty):
             return block
         nonce += 1
@@ -321,8 +321,8 @@ def test_equal_height_tiebreak_with_shared_transaction():
     genesis = bc.tip
 
     # Distinct timestamps -> distinct block hashes for the two competing blocks.
-    a = mine_block(1, genesis.block_hash, [tx.tx_hash], 1_718_000_001)
-    b = mine_block(1, genesis.block_hash, [tx.tx_hash], 1_718_000_002)
+    a = mine_block(1, genesis.block_hash, [tx], 1_718_000_001)
+    b = mine_block(1, genesis.block_hash, [tx], 1_718_000_002)
     smaller, larger = sorted((a, b), key=lambda blk: blk.block_hash)
 
     accepted, _, _ = bc.add_block(larger)
@@ -343,12 +343,12 @@ def test_longer_branch_reusing_transaction_is_adopted():
     bc.accept_transaction(tx)
     genesis = bc.tip
 
-    ours = mine_block(1, genesis.block_hash, [tx.tx_hash], 1_718_000_001)
+    ours = mine_block(1, genesis.block_hash, [tx], 1_718_000_001)
     bc.add_block(ours)
     assert bc.tip.block_hash == ours.block_hash
 
     # Competing branch: b1 also carries the tx, b2 extends it one higher.
-    b1 = mine_block(1, genesis.block_hash, [tx.tx_hash], 1_718_000_050)
+    b1 = mine_block(1, genesis.block_hash, [tx], 1_718_000_050)
     b2 = mine_block(2, b1.block_hash, [], 1_718_000_051)
 
     # Out-of-order delivery: tip first, then the missing parent.
@@ -368,8 +368,8 @@ def test_genuine_double_spend_within_branch_is_rejected():
     bc.accept_transaction(tx)
     genesis = bc.tip
 
-    b1 = mine_block(1, genesis.block_hash, [tx.tx_hash], 1_718_000_001)
-    b2 = mine_block(2, b1.block_hash, [tx.tx_hash], 1_718_000_002)
+    b1 = mine_block(1, genesis.block_hash, [tx], 1_718_000_001)
+    b2 = mine_block(2, b1.block_hash, [tx], 1_718_000_002)
 
     bc.add_block(b1)
     bc.add_block(b2)
@@ -379,14 +379,44 @@ def test_genuine_double_spend_within_branch_is_rejected():
     assert bc.tip.block_hash == b1.block_hash
 
 
+def test_handle_block_fills_transactions_from_mempool():
+    """Compact relay omits tx bodies the peer believes we know; use our mempool."""
+    _keys, _private_keys, (community, peer, _other) = make_miners()
+    tx = signed_tx(b"already in mempool")
+    community.blockchain.accept_transaction(tx)
+    genesis = community.blockchain.tip
+
+    block = mine_block(1, genesis.block_hash, [tx], 1_718_000_001)
+
+    community.handle_block(
+        peer,
+        block.height,
+        block.prev_hash,
+        block.txs_hash,
+        block.timestamp,
+        block.difficulty,
+        block.nonce,
+        b"".join(block.tx_hashes),
+    )
+
+    assert community.blockchain.height == 1
+    assert community.blockchain.tip.block_hash == block.block_hash
+    assert tx.tx_hash in community.blockchain.chain_tx_hashes
+
+
 def test_branch_waits_for_missing_transaction_in_parent_block():
     """A valid empty tip must not pull in a parent whose tx body is still missing."""
     bc = Blockchain()
     tx = signed_tx(b"parent tx arrives later")
     genesis = bc.tip
 
-    b1 = mine_block(1, genesis.block_hash, [tx.tx_hash], 1_718_000_001)
-    b2 = mine_block(2, b1.block_hash, [], 1_718_000_002)
+    b1_full = mine_block(1, genesis.block_hash, [tx], 1_718_000_001)
+    b2 = mine_block(2, b1_full.block_hash, [], 1_718_000_002)
+    # Simulate receiving the parent header without its embedded transaction body.
+    b1 = Block(
+        b1_full.height, b1_full.prev_hash, b1_full.txs_hash, b1_full.timestamp,
+        b1_full.difficulty, b1_full.nonce, b1_full.block_hash, b1_full.tx_hashes, [],
+    )
 
     # Tip first: it is stored, but the parent is unknown.
     accepted, missing, missing_txs = bc.add_block(b2)
@@ -405,7 +435,7 @@ def test_branch_waits_for_missing_transaction_in_parent_block():
     assert bc.height == 0
     assert tx.tx_hash not in bc.chain_tx_hashes
 
-    # Once the tx arrives, the same branch becomes adoptable.
+    # Once the tx arrives, attach it to the waiting block and adopt.
     bc.accept_transaction(tx)
     bc.try_adopt()
     assert bc.height == 2
